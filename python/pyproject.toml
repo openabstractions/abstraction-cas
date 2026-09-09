@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "abstraction-cas"
 version = "0.1.0"
 description = "Compare-and-set over a file. The floor under every service that keeps state in a file."
+readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = []
 

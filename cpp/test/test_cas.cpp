@@ -21,6 +21,10 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <cstdint>
+#endif
 extern char** environ;
 #endif
 
@@ -164,10 +168,25 @@ static void kill(Child c) { TerminateProcess(c, 1); }
 #else
 using Child = pid_t;
 
+static std::string self_path() {
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    buf.resize(std::string(buf.c_str()).size());
+    std::error_code ec;
+    const fs::path real = fs::canonical(buf, ec);
+    return ec ? buf : real.string();
+#else
+    return fs::read_symlink("/proc/self/exe").string();
+#endif
+}
+
 static Child spawn(const std::string& role, int n) {
     setenv("CAS_ROLE", role.c_str(), 1);
     setenv("CAS_N", std::to_string(n).c_str(), 1);
-    std::string exe = fs::read_symlink("/proc/self/exe").string();
+    std::string exe = self_path();
     char* argv[] = {exe.data(), nullptr};
     pid_t pid;
     if (posix_spawn(&pid, exe.c_str(), nullptr, nullptr, argv, environ) != 0) {
