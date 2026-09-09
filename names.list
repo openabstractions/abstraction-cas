@@ -1,0 +1,17 @@
+> File names every implementation must survive, one per line, UTF-8, no BOM.
+> Read by cas/python/test_abstraction_cas.py and by cas/mixed.py, which puts the
+> last one on CAS_PATH so Go, C++ and Python are all held to it. Blank lines and
+> lines starting with > are skipped.
+>
+> Until 2026-09-09 no test in any of the three languages used a file name longer
+> than one ASCII letter, and the Windows rename in Python had counted code points
+> where the kernel counts UTF-16 units since it was written: one emoji in the name
+> and the bytes landed under a name nobody asked for, while write returned.
+
+v
+stāvoklis
+状態
+noél
+smile😀
+😀😀x
+n😀-stāvoklis-状態-noél

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abstraction-cas"
+version = "0.1.0"
+description = "Compare-and-set over a file. The floor under every service that keeps state in a file."
+license = "Apache-2.0"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/openabstractions/abstraction-cas"
+
+[tool.setuptools]
+py-modules = ["abstraction_cas"]
