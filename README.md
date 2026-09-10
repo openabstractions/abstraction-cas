@@ -102,8 +102,7 @@ and a reader does block a replace; see below.
 **The lock is one machine's.** A byte-range lock taken over SMB and a `flock`
 taken on the server's own volume never meet: writers on the PC and on the NAS
 on one file lost or refused 147–149 of 2150 updates in three runs of three,
-every PC writer dying within its first few changes
-(`feedback/2026-09-06-shareloc.md`, harness `research/locks/twohost.py`). Six
+every PC writer dying within its first few changes. Six
 writers in three languages on the PC alone, over the same share, lost nothing
 in 1800. Two hosts on one record need a protocol this file does not have.
 
@@ -142,7 +141,7 @@ counter as a `writer` or reads until it sees `CAS_N` as a `reader`, aborting on
 a torn read. Add its command to `commands()`; the run counts its updates with
 ours. A fourth implementation whose lock ours cannot see loses a third of its
 updates on the first run — measured with a Python writer on byte 1 on Windows
-and on `lockf` on Linux, in `feedback/2026-09-06-mixedgate.md`. `mixed.py`
+and on `lockf` on Linux, by that seventh process. `mixed.py`
 takes a directory as its second argument; a UNC path runs the six on a share.
 
 ## Today

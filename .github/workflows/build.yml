@@ -105,8 +105,8 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      # The file list, not a build file. research/truth92 measured this exact
-      # route under g++ and MSVC; the published CMakeLists.txt was dropped
+      # The file list, not a build file. This exact route was measured by hand
+      # under g++ and MSVC; the published CMakeLists.txt was dropped
       # because it fetched a dependency these sources no longer use.
       - name: compile and run
         run: |
@@ -152,7 +152,7 @@ jobs:
           {
             printf '\n### UNPROVEN\n\nThis workflow builds what this repository contains, and nothing else. It ran none of:\n\n'
             printf -- '- the cross-language conformance harnesses, which compare bytes across all three languages and live in the private tree\n'
-            printf -- '- MSVC. The c++ job takes whichever of g++ or clang++ is on PATH; research/truth92 measured MSVC by hand and this does not re-measure it\n'
+            printf -- '- MSVC. The c++ job takes whichever of g++ or clang++ is on PATH, and this does not re-measure MSVC\n'
             printf -- '- any signed or installed artefact\n'
             printf -- '- delegation to a real BITS, launchd or NAS tier\n'
           } >> "$GITHUB_STEP_SUMMARY"
