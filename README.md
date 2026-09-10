@@ -1,7 +1,9 @@
 # abstraction-cas
 
-**In development.** Tagged `go/v0.1.0`, but this page predates that tag: no
-capability claim, no contract page, no conformance scenario of its own.
+**In development.** No capability claim, no contract page, no conformance
+scenario of its own. Tags exist and no version number is typed on this page:
+[the tag list](https://github.com/openabstractions/abstraction-cas/tags) is the
+answer to "which release", because a tag is the only thing that cannot drift.
 
 A file is replaced whole or not at all, and every change is applied to the value
 the previous change left — across processes and across languages sharing one
@@ -32,17 +34,20 @@ No rule on this page carries a tag. The invariants below each carry a test, and
 
 ## Obtain
 
-- **Go.** `go get github.com/openabstractions/abstraction-cas/go`. No tag yet;
-  `go get` resolves a pseudo-version of `main`.
-- **Python.** Not on any index. `python/abstraction_cas.py` is one module with
-  no imports of ours; `python/pyproject.toml` builds a wheel
-  (`pip wheel python/`).
+- **Go.** `go get github.com/openabstractions/abstraction-cas/go`.
+  [Releases, newest first](https://github.com/openabstractions/abstraction-cas/tags);
+  pin the exact tag you tested against.
+- **Python.** Not on any index —
+  [what to install, import and call](python/README.md).
 - **C++.** One header and one source, C++17, standard library only, and no build
   file: name them. `g++ -std=c++17 -I cpp/include cpp/test/test_cas.cpp
   cpp/src/cas.cpp -o test_cas` compiles and passes this layer's own test; MSVC
   19.51 takes the same two files under `/std:c++17` and `/I`. Measured
   2026-09-09. There
   is no tagged release and no package.
+
+Whether to adopt this at all, what it costs and what is not proven:
+[Adopting](CONTRIBUTING.md#adopting).
 
 ## Example
 
