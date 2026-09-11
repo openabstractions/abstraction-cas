@@ -250,3 +250,35 @@ only. C++17.
 ## Licence
 
 Apache-2.0. See [LICENSE](https://github.com/openabstractions/abstraction-cas/blob/main/LICENSE).
+
+## Schema-defined direct API
+
+`cas.thrift` defines Read and Write with `--no-ipc`: no daemon, client transport
+or service endpoint is implied. Generated API reference is
+[abstraction.cas.api.schema.html](abstraction.cas.api.schema.html).
+
+Go callers can use `github.com/openabstractions/abstraction-cas/go/api`:
+`var store api.Store = api.FileStore{}`. C++ callers include
+`<abstraction/cas_api.h>` and use `abstraction::cas::FileStore` through
+`abstraction::cas::api::Store`, linking the existing `abstraction::cas` target.
+These adapters use the existing native provider and preserve its errors.
+The original functions and callback-based Change remain available unchanged.
+
+Read returns a Value: absent data means no file; present empty data means an
+empty file. Data is arbitrary bytes, not UTF-8 text. Write compares presence
+as well as bytes before replacement. Generated Go, C++ and Python descriptors
+include canonical Base64 record codecs; codec availability does not imply IPC.
+The Python descriptor is generated source under `py/`; it is not yet wired into
+the existing Python package's installed public API.
+
+For an installed C++ dependency, configure and build `cpp/`, then run
+`cmake --install <build> --config Release --prefix <prefix>`. Consumers use
+`find_package(abstraction_cas 0.1 CONFIG REQUIRED)` and link `abstraction::cas`.
+The install includes both the native and generated headers. A standalone
+consumer regression lives at `cpp/test/installed`: configure it with
+`-DCMAKE_PREFIX_PATH=<prefix>`, build it, then run CTest in its build directory.
+
+Write propagates native Go `ErrMoved` and C++ `Moved` on comparison mismatch.
+The schema currently documents that error in prose: the generator does not yet
+support declared `exception`/`throws` types. Its RPC `ServiceError` mechanism
+is not emitted for this direct API and does not replace those native errors.

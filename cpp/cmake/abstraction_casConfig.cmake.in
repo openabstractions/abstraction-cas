@@ -1,0 +1,3 @@
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/abstraction_casTargets.cmake")
+check_required_components(abstraction_cas)
