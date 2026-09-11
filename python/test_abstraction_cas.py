@@ -1,4 +1,4 @@
-"""The five invariants of cas/README.md, as stress. Mirrors cas/go/cas_test.go."""
+"""The five invariants of abstraction-cas/README.md, as stress. Mirrors abstraction-cas/go/cas_test.go."""
 
 import os
 import pathlib

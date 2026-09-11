@@ -9,7 +9,7 @@ import time
 here = os.path.dirname(os.path.abspath(__file__))
 repo = os.path.dirname(here)
 sys.path.insert(0, os.path.join(here, "python"))
-sys.path.insert(0, os.path.join(repo, "job", "python"))
+sys.path.insert(0, os.path.join(repo, "abstraction-job", "python"))
 import abstraction_cas as cas
 
 per, each = 2, 100
@@ -60,8 +60,8 @@ class JobRecord:
     def commands(self, build):
         return {
             "cpp": [cpp("JOB_CPP", "test_job_store")],
-            "go": [go_test_binary(build, os.path.join(repo, "job", "go")), "-test.run=^$"],
-            "python": [sys.executable, os.path.join(repo, "job", "python", "test_abstraction_job.py")],
+            "go": [go_test_binary(build, os.path.join(repo, "abstraction-job", "go")), "-test.run=^$"],
+            "python": [sys.executable, os.path.join(repo, "abstraction-job", "python", "test_abstraction_job.py")],
         }
 
     def subject(self, d):

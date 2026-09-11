@@ -1,5 +1,5 @@
 > File names every implementation must survive, one per line, UTF-8, no BOM.
-> Read by cas/python/test_abstraction_cas.py and by cas/mixed.py, which puts the
+> Read by abstraction-cas/python/test_abstraction_cas.py and by abstraction-cas/mixed.py, which puts the
 > last one on CAS_PATH so Go, C++ and Python are all held to it. Blank lines and
 > lines starting with > are skipped.
 >
