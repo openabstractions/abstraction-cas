@@ -15,6 +15,8 @@ const (
 
 var lockFileEx = syscall.NewLazyDLL("kernel32.dll").NewProc("LockFileEx")
 
+func openBoundedRecord(root *os.Root, name string) (*os.File, error) { return root.Open(name) }
+
 func transient(err error) bool {
 	return errors.Is(err, sharingViolation) || errors.Is(err, accessDenied)
 }
