@@ -29,11 +29,14 @@ def increment(cur):
 
 
 def role(name, path, target):
+    store = abstraction_cas
+    if os.environ.get("CAS_SIDE"):
+        store = abstraction_cas.Placement(os.environ["CAS_ROOT"], os.environ["CAS_SIDE"])
     if name == "writer":
         for _ in range(target):
-            change(path, increment)
+            store.change(path, increment)
     elif name == "reader":
-        while counter(read(path)) != target:
+        while counter(store.read(path)) != target:
             pass
 
 
@@ -167,6 +170,29 @@ class CasTest(unittest.TestCase):
                          "a killed writer's staged file survived the sweep")
         self.assertEqual(sweep(p), 0)
 
+    def test_sweep_removes_only_staged_names_of_the_path(self):
+        p = self.path("n")
+        write(p, None, b"1 1")
+        staged = ["n.4242.tmp", "n.a_B9.tmp"]
+        # Another file's staged name, a dotted unique part, no unique part, and
+        # the staged name of the file n.lock: none belongs to n.
+        decoys = ["m.123.tmp", "n.lock.123.tmp", "n.x.y.tmp", "n.tmp"]
+        for name in staged + decoys:
+            with open(self.path(name), "wb") as f:
+                f.write(b"x")
+        self.assertEqual(sweep(p), len(staged))
+        self.assertEqual(sorted(os.listdir(self.dir.name)), sorted(["n", "n.lock"] + decoys))
+        self.assertEqual(sweep(p), 0)
+        store = abstraction_cas.Placement(self.path("root"), self.path("side"))
+        placed = os.path.join(store.root, "m", "latest")
+        store.write(placed, None, b"v")
+        side_dir = os.path.join(store.side, "m")
+        for name in ("latest.77.tmp", "latest.lock.77.tmp"):
+            with open(os.path.join(side_dir, name), "wb") as f:
+                f.write(b"x")
+        self.assertEqual(store.sweep(placed), 1)
+        self.assertEqual(sorted(os.listdir(side_dir)), ["latest.lock", "latest.lock.77.tmp"])
+
     def test_an_edit_that_returns_no_value_is_refused(self):
         p = self.path("v")
         write(p, None, b"first")
@@ -215,6 +241,106 @@ class CasTest(unittest.TestCase):
         self.assertEqual(reader.wait(), 0)
         self.assertEqual(counter(read(p)), writers * each)
         self.assertEqual(len(os.listdir(self.dir.name)), 2, "contention left files behind")
+
+    def placement(self):
+        return abstraction_cas.Placement(self.path("root"), self.path("side"))
+
+    def files(self, directory):
+        found = []
+        for dirpath, _, names in os.walk(directory):
+            found += [os.path.relpath(os.path.join(dirpath, n), directory).replace(os.sep, "/") for n in names]
+        return sorted(found)
+
+    def test_a_placement_keeps_locks_and_staging_out_of_root(self):
+        store = self.placement()
+        p = os.path.join(store.root, "host", "ns", "model", "latest")
+        store.write(p, None, b"1")
+        with self.assertRaises(Moved):
+            store.write(p, None, b"2")
+        store.change(p, lambda cur: cur + b"!")
+        self.assertEqual(store.read(p), b"1!")
+        self.assertEqual(self.files(store.root), ["host/ns/model/latest"])
+        self.assertEqual(self.files(store.side), ["host/ns/model/latest.lock"])
+
+    def test_a_placement_refuses_what_it_does_not_cover(self):
+        store = self.placement()
+        for p in (store.root, self.path("elsewhere"), os.path.join(store.side, "x"),
+                  os.path.join(store.root, os.pardir, "escape")):
+            with self.subTest(path=p):
+                with self.assertRaises(abstraction_cas.OutsideRoot):
+                    store.write(p, None, b"x")
+                with self.assertRaises(abstraction_cas.OutsideRoot):
+                    store.read(p)
+        for side in (store.root, self.dir.name):
+            with self.subTest(side=side), self.assertRaises(ValueError):
+                abstraction_cas.Placement(store.root, side)
+
+    def test_a_placement_refuses_another_volume(self):
+        real = abstraction_cas._volume
+        abstraction_cas._volume = lambda d: 2 if os.path.basename(d) == "side" else 1
+        self.addCleanup(setattr, abstraction_cas, "_volume", real)
+        with self.assertRaises(abstraction_cas.CrossVolume):
+            abstraction_cas.Placement(self.path("root"), self.path("side"))
+
+    def test_a_placement_refuses_a_real_second_volume(self):
+        here = os.stat(self.dir.name).st_dev
+        if sys.platform == "win32":
+            candidates = ["%s:\\" % c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+        else:
+            candidates = ["/dev/shm", "/run"]
+        for other in candidates:
+            try:
+                if os.path.isdir(other) and os.stat(other).st_dev != here:
+                    break
+            except OSError:
+                continue
+        else:
+            self.skipTest("no second volume on this machine")
+        with self.assertRaises(abstraction_cas.CrossVolume):
+            abstraction_cas.Placement(self.path("root"), other)
+
+    def test_a_placement_kill_between_stage_and_rename_keeps_root_clean(self):
+        store = self.placement()
+        p = os.path.join(store.root, "m", "latest")
+        store.write(p, None, b"first")
+        killed = ("import os, sys\n"
+                  "sys.path.insert(0, sys.argv[1])\n"
+                  "import abstraction_cas as cas\n"
+                  "cas._rename_over = lambda *a: os._exit(9)\n"
+                  "cas.Placement(sys.argv[3], sys.argv[4]).write(sys.argv[2], b'first', b'second')\n")
+        child = subprocess.run([sys.executable, "-c", killed,
+                                os.path.dirname(abstraction_cas.__file__), p, store.root, store.side])
+        self.assertEqual(child.returncode, 9)
+        self.assertEqual(store.read(p), b"first")
+        self.assertEqual(self.files(store.root), ["m/latest"], "the killed writer left a file in root")
+        staged = [n for n in self.files(store.side) if n.endswith(".tmp")]
+        self.assertEqual(len(staged), 1, "the kill left nothing staged, so this proves nothing")
+        self.assertTrue(staged[0].startswith("m/latest."), staged)
+        store.write(p, b"first", b"second")
+        self.assertEqual(store.read(p), b"second")
+        self.assertEqual(store.sweep(p), 1)
+        self.assertEqual(self.files(store.side), ["m/latest.lock"])
+
+    def test_a_placement_loses_no_update_across_processes(self):
+        store = self.placement()
+        p = os.path.join(store.root, "sub", "n")
+        writers, each = 4, 100
+
+        def spawn(name, n):
+            env = dict(os.environ, CAS_PATH=p, CAS_ROOT=store.root, CAS_SIDE=store.side,
+                       CAS_ROLE=name, CAS_N=str(n))
+            return subprocess.Popen([sys.executable, __file__], env=env)
+
+        reader = spawn("reader", writers * each)
+        ws = [spawn("writer", each) for _ in range(writers)]
+        codes = [w.wait() for w in ws]
+        if any(codes):
+            reader.kill()
+        self.assertEqual(codes, [0] * writers)
+        self.assertEqual(reader.wait(), 0)
+        self.assertEqual(counter(store.read(p)), writers * each)
+        self.assertEqual(self.files(store.root), ["sub/n"])
+        self.assertEqual(self.files(store.side), ["sub/n.lock"])
 
     def test_an_ended_record_stays_ended(self):
         p = self.path("r")

@@ -27,6 +27,7 @@ needs its page, not this.
 | **change** | read, edit and write under the lock, so an edit always sees the truth and never needs a retry |
 | **base** | the value a writer read; `nil` means *only if the file does not exist* |
 | **lock** | byte 0 of `<path>.lock`, exclusive, blocking, released by the kernel when the holder dies |
+| **placement** | a root and a side directory on its volume; for `<root>/<rel>` the lock is `<side>/<rel>.lock` and the replacement is staged in `<side>` |
 
 No rule on this page carries a tag. The invariants below each carry a test, and
 *What a fourth implementation must do* is cited by
@@ -75,6 +76,14 @@ for missing, `Moved` thrown, an edit refuses by throwing). All three share one
 lock and one rename, so writers in different languages on one file do not lose
 each other's updates; `mixed.py` proves it and `scripts/check.sh` runs it.
 
+A directory that is read by listing it needs its data files alone. A placement
+keeps the lock file and staged replacements in a side directory on the same
+volume: `cas.NewPlacement(root, side)` in Go, `Placement(root, side)` in Python
+and `abstraction::cas::Placement` in C++, each with the same `Read`, `Write` and
+`Change` (Python adds `sweep`). For `<root>/a/b` the lock is `<side>/a/b.lock`,
+and the replacement is staged as `<side>/a/b.<unique>.tmp`. The calls without a
+placement are unchanged and keep both beside the file.
+
 ## Invariants, each with a test in `go/cas_test.go`, `python/test_abstraction_cas.py`, `cpp/test/test_cas.cpp`
 
 - **Whole or nothing.** A reader at any moment, from any process, sees a value
@@ -86,6 +95,9 @@ each other's updates; `mixed.py` proves it and `scripts/check.sh` runs it.
   refusing on the truth, so nothing can be walked backwards by a writer that
   read earlier.
 - **Nothing left behind.** Contention and refusal leave no temporary files.
+- **A placement keeps its root to data files.** Under a placement, root holds
+  only the files written, through contention across processes and after a
+  writer killed between staging and renaming (`go/placement_test.go`).
 
 ## How
 
@@ -134,6 +146,18 @@ writer with another lock passes all of them and loses updates against ours.
   removed. POSIX is `rename(2)`.
 - **`Read` opens with every share mode on Windows** and holds the handle for
   the read only.
+- **A placement moves the lock and the staging directory, and nothing else.**
+  For `<root>/<rel>`, where `<rel>` is the path relative to root, the lock is
+  byte 0 of `<side>/<rel>.lock` and the replacement is staged in the directory
+  of `<side>/<rel>` under the same unique-name rule, then renamed over
+  `<root>/<rel>`. Both directories are created when missing.
+- **A placement refuses what its rename cannot serve.** A side directory that
+  is root or contains it is refused. So is one on another volume than root:
+  `st_dev` on POSIX, the volume serial number on Windows. A path that is root,
+  lies outside it, or lies inside side is refused.
+- **Every writer of one file uses the same placement.** `<path>.lock` and
+  `<side>/<rel>.lock` are two locks that exclude nobody. `mixed.py 3 --side`
+  runs the six writers and three readers through one placement.
 
 Prove it by being the seventh process in `mixed.py`: a program that, given
 `CAS_PATH`, `CAS_ROLE` and `CAS_N`, applies `CAS_N` increments of the `"n n"`
@@ -173,10 +197,11 @@ What may break:
   it, rather than returning either value.
 - Every write is an fsync: about 6 ms on this machine. Right for a policy file
   written at human rate; wrong for a lease renewed every millisecond.
-- **Python flushes the directory after the rename; Go and C++ do not yet.**
-  Without that flush a power cut can lose the rename: the previous value
-  survives, the acknowledged one may not. Python opens the directory and
-  flushes it — `fsync` on POSIX, `FlushFileBuffers` on a
+- **Every writer flushes the directory after the rename on POSIX; on Windows
+  only Python does.** Without that flush a power cut can lose the rename: the
+  previous value survives, the acknowledged one may not. Go and C++ `fsync` the
+  directory on POSIX and treat `EINVAL` and `ENOTSUP` as a file system that
+  cannot, as Python does. Python opens the directory and flushes it — `fsync` on POSIX, `FlushFileBuffers` on a
   `FILE_FLAG_BACKUP_SEMANTICS` handle on Windows — and raises anything it does
   not recognise. Where the volume answers `ERROR_INVALID_FUNCTION`,
   `ERROR_NOT_SUPPORTED` or `ERROR_ACCESS_DENIED` — Samba over SMB is the one we
@@ -192,7 +217,16 @@ What may break:
   would cost every write the directory's size. The name is the sweeper's
   handle — anything matching `<name>.*.tmp` beside the file is dead, because a
   live writer stages under the lock. Python's `sweep(path)` takes that lock and
-  removes them, and returns how many; Go and C++ have no such call yet.
+  removes them, and returns how many. Go's `cas.Sweep(path)` and C++'s
+  `abstraction::cas::sweep(path)` do the same. All three match only a unique
+  part of letters, digits and underscores, so `<name>.lock.<unique>.tmp`, which
+  belongs to the file `<name>.lock`, is left alone. Under
+  a placement the temporary is `<side>/<rel>.<unique>.tmp`, root keeps only its
+  data file, and each language's `Placement` sweep removes it.
+- A placement compares volumes, not mounts. Two bind mounts of one Linux file
+  system share `st_dev`, and a rename between them still fails with `EXDEV`:
+  the write returns that error with the temporary removed and the file
+  unchanged.
 - A reader that polls is a tax on every writer of the file on Windows: 4.4 ms
   per update alone, 6 to 16 ms with one reader spinning, from open-close
   contention on the name and not from the rename retry.
@@ -213,7 +247,8 @@ What may break:
   is no delete). An edit that returns what it was given changes nothing, and on
   a missing file that means the file stays missing. C++ cannot express it: its
   `Edit` returns `std::string`.
-- The lock file stays. Delete the data file and `<path>.lock` together.
+- The lock file stays. Delete the data file and `<path>.lock` together; under a
+  placement, the data file and `<side>/<rel>.lock`.
 
 ## Conformance
 

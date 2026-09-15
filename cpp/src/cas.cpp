@@ -8,12 +8,31 @@
 namespace fs = std::filesystem;
 using abstraction::cas::Value;
 
+// Test hooks. This layer's own tests set them; applications never do.
+namespace abstraction::cas::testing {
+void (*after_stage)(const std::filesystem::path& staged) = nullptr;
+void (*after_directory_sync)(const std::filesystem::path& directory) = nullptr;
+}
+
 namespace {
 
-fs::path fresh(const fs::path& path) {
+fs::path fresh(const fs::path& dir, const fs::path& name) {
     static std::random_device seed;
-    fs::path tmp = path;
+    fs::path tmp = dir / name;
     return tmp += "." + std::to_string(seed()) + ".tmp";
+}
+
+// The files one write uses: the data file, its lock and the directory its
+// replacement is staged in.
+struct Placed {
+    fs::path target, lock, stage;
+};
+
+// The default placement: the lock and the staged file sit beside the data file.
+Placed beside(const fs::path& path) {
+    fs::path lock = path;
+    lock += ".lock";
+    return {path, lock, path.parent_path()};
 }
 
 }
@@ -74,8 +93,8 @@ struct Lock {
     }
 };
 
-fs::path stage(const fs::path& p, const std::string& data) {
-    fs::path tmp = fresh(p);
+fs::path stage(const Placed& p, const std::string& data) {
+    fs::path tmp = fresh(p.stage, p.target.filename());
     Handle f(CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (!f.open()) fail("create", tmp, GetLastError());
     DWORD n = 0;
@@ -108,12 +127,25 @@ Err rename_over(const fs::path& tmp, const fs::path& to) {
     return MoveFileExW(tmp.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING) ? 0 : GetLastError();
 }
 
+unsigned long long volume_of(const fs::path& dir) {
+    Handle f(CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES, share_all, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!f.open()) fail("open", dir, GetLastError());
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(f.h, &info)) fail("volume", dir, GetLastError());
+    return info.dwVolumeSerialNumber;
+}
+
+// C++ flushes the directory on POSIX only.
+void sync_dir(const fs::path&) {}
+
 }
 
 #else
 
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
 
@@ -157,8 +189,8 @@ struct Lock {
     }
 };
 
-fs::path stage(const fs::path& p, const std::string& data) {
-    fs::path tmp = fresh(p);
+fs::path stage(const Placed& p, const std::string& data) {
+    fs::path tmp = fresh(p.stage, p.target.filename());
     Handle f(::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
     if (!f.open()) fail("create", tmp, errno);
     for (size_t done = 0; done < data.size();) {
@@ -184,31 +216,116 @@ Err rename_over(const fs::path& tmp, const fs::path& to) {
     return ::rename(tmp.c_str(), to.c_str()) == 0 ? 0 : errno;
 }
 
+unsigned long long volume_of(const fs::path& dir) {
+    struct stat st;
+    if (::stat(dir.c_str(), &st) != 0) fail("stat", dir, errno);
+    return (unsigned long long)st.st_dev;
+}
+
+// Flushes a directory after a rename in it, so the new entry survives a power
+// cut. A file system that cannot sync a directory answers EINVAL or ENOTSUP, and
+// the write stands without that guarantee.
+void sync_dir(const fs::path& dir) {
+    const fs::path where = dir.empty() ? fs::path(".") : dir;
+    Handle d(::open(where.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY));
+    if (!d.open()) fail("open", where, errno);
+    if (fsync(d.fd) != 0 && errno != EINVAL && errno != ENOTSUP) fail("sync", where, errno);
+}
+
 }
 
 #endif
 
 namespace {
 
-Lock lock(const fs::path& path) {
-    if (fs::path dir = path.parent_path(); !dir.empty()) fs::create_directories(dir);
-    fs::path p = path;
-    return Lock(p += ".lock");
+Lock lock(const Placed& p) {
+    if (fs::path dir = p.target.parent_path(); !dir.empty()) fs::create_directories(dir);
+    if (fs::path dir = p.lock.parent_path(); !dir.empty()) fs::create_directories(dir);
+    return Lock(p.lock);
 }
 
-void replace(const fs::path& path, const Value& base, const std::string& data) {
-    if (read_file(path) != base) throw abstraction::cas::Moved(path);
-    fs::path tmp = stage(path, data);
+void replace(const Placed& p, const Value& base, const std::string& data) {
+    if (read_file(p.target) != base) throw abstraction::cas::Moved(p.target);
+    fs::path tmp = stage(p, data);
+    if (abstraction::cas::testing::after_stage) abstraction::cas::testing::after_stage(tmp);
     Err e = 0;
     for (int tries = 0; tries < 1000; ++tries) {
-        e = rename_over(tmp, path);
+        e = rename_over(tmp, p.target);
         if (!transient(e)) break;
     }
     if (e) {
         std::error_code ignored;
         fs::remove(tmp, ignored);
-        fail("rename", path, e);
+        fail("rename", p.target, e);
     }
+    fs::path dir = p.target.parent_path();
+    sync_dir(dir);
+    if (abstraction::cas::testing::after_directory_sync) abstraction::cas::testing::after_directory_sync(dir);
+}
+
+using Native = fs::path::string_type;
+
+// Whether name is <prefix><unique>.tmp with a unique part of letters, digits and
+// underscores: the names this writer, Go's CreateTemp and Python's mkstemp give
+// a staged replacement. A dot in the unique part belongs to another file's name.
+bool staged_name(const Native& name, const Native& prefix) {
+    const Native suffix = fs::path(".tmp").native();
+    if (name.size() <= prefix.size() + suffix.size() || name.compare(0, prefix.size(), prefix) != 0 ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+        return false;
+    for (size_t i = prefix.size(); i < name.size() - suffix.size(); ++i) {
+        auto c = name[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')) return false;
+    }
+    return true;
+}
+
+int sweep_placed(const Placed& p) {
+    Lock held = lock(p);
+    Native prefix = p.target.filename().native();
+    prefix += fs::path(".").native();
+    const fs::path dir = p.stage.empty() ? fs::path(".") : p.stage;
+    int gone = 0;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        std::error_code type;
+        if (!entry.is_regular_file(type) || !staged_name(entry.path().filename().native(), prefix)) continue;
+        std::error_code removed;
+        if (fs::remove(entry.path(), removed)) ++gone;
+    }
+    if (ec) throw std::system_error(ec, "sweep " + dir.string());
+    return gone;
+}
+
+void change_placed(const Placed& p, const abstraction::cas::Edit& edit) {
+    Lock held = lock(p);
+    Value cur = read_file(p.target);
+    std::string next = edit(cur);
+    if (cur != next) replace(p, cur, next);
+}
+
+fs::path clean(const fs::path& p) {
+    fs::path out = fs::absolute(p).lexically_normal();
+    if (!out.has_filename() && out.has_relative_path()) out = out.parent_path();
+    return out;
+}
+
+// child relative to parent, or nothing when child is neither parent nor under it.
+std::optional<fs::path> relative_within(const fs::path& parent, const fs::path& child) {
+    fs::path rel = child.lexically_relative(parent);
+    if (rel.empty()) return std::nullopt;
+    if (auto first = rel.begin(); first != rel.end() && *first == "..") return std::nullopt;
+    return rel;
+}
+
+Placed place(const fs::path& root, const fs::path& side, const fs::path& path) {
+    fs::path target = clean(path);
+    std::optional<fs::path> rel = relative_within(root, target);
+    if (!rel || *rel == "." || relative_within(side, target)) throw abstraction::cas::OutsideRoot(target, root);
+    fs::path mirror = side / *rel;
+    fs::path lock = mirror;
+    lock += ".lock";
+    return {target, lock, mirror.parent_path()};
 }
 
 }
@@ -218,15 +335,35 @@ namespace abstraction::cas {
 Value read(const fs::path& path) { return read_file(path); }
 
 void write(const fs::path& path, const Value& base, const std::string& data) {
-    Lock held = lock(path);
-    replace(path, base, data);
+    Placed p = beside(path);
+    Lock held = lock(p);
+    replace(p, base, data);
 }
 
-void change(const fs::path& path, const Edit& edit) {
-    Lock held = lock(path);
-    Value cur = read_file(path);
-    std::string next = edit(cur);
-    if (cur != next) replace(path, cur, next);
+void change(const fs::path& path, const Edit& edit) { change_placed(beside(path), edit); }
+
+int sweep(const fs::path& path) { return sweep_placed(beside(path)); }
+
+Placement::Placement(const fs::path& root, const fs::path& side) : root_(clean(root)), side_(clean(side)) {
+    if (relative_within(side_, root_))
+        throw std::invalid_argument("cas: side directory " + side_.string() + " contains root " + root_.string());
+    fs::create_directories(root_);
+    fs::create_directories(side_);
+    if (volume_of(root_) != volume_of(side_)) throw CrossVolume(root_, side_);
 }
+
+Value Placement::read(const fs::path& path) const { return read_file(place(root_, side_, path).target); }
+
+void Placement::write(const fs::path& path, const Value& base, const std::string& data) const {
+    Placed p = place(root_, side_, path);
+    Lock held = lock(p);
+    replace(p, base, data);
+}
+
+void Placement::change(const fs::path& path, const Edit& edit) const {
+    change_placed(place(root_, side_, path), edit);
+}
+
+int Placement::sweep(const fs::path& path) const { return sweep_placed(place(root_, side_, path)); }
 
 }

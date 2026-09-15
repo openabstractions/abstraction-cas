@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func counter(cur []byte) int {
@@ -33,17 +34,37 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 	target, _ := strconv.Atoi(n)
+	read, change := Read, Change
+	if side := os.Getenv("CAS_SIDE"); side != "" {
+		p, err := NewPlacement(os.Getenv("CAS_ROOT"), side)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		read, change = p.Read, p.Change
+	}
 	switch os.Getenv("CAS_ROLE") {
+	case "killed":
+		// Stage one change, report it, and wait to be killed before the rename.
+		afterStage = func(string) {
+			fmt.Println("STAGED")
+			os.Stdout.Sync()
+			time.Sleep(2 * time.Minute)
+		}
+		if err := change(path, increment); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 	case "writer":
 		for range target {
-			if err := Change(path, increment); err != nil {
+			if err := change(path, increment); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(2)
 			}
 		}
 	case "reader":
 		for {
-			b, err := Read(path)
+			b, err := read(path)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(2)

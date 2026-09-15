@@ -80,17 +80,24 @@ class JobRecord:
         return total
 
 
-def spawn(prefix, cmd, role, path, n):
-    env = dict(os.environ, **{prefix + "_PATH": path, prefix + "_ROLE": role, prefix + "_N": str(n)})
+def spawn(prefix, cmd, role, path, n, extra):
+    env = dict(os.environ, **{prefix + "_PATH": path, prefix + "_ROLE": role, prefix + "_N": str(n)}, **extra)
     return subprocess.Popen(cmd, env=env)
 
 
-def one_run(subject, cmds, where, i):
-    path = subject.subject(tempfile.mkdtemp(dir=where))
+def one_run(subject, cmds, where, i, side):
+    d = tempfile.mkdtemp(dir=where)
+    extra, sidedir = {}, None
+    if side:
+        root, sidedir = os.path.join(d, "root"), os.path.join(d, "side")
+        cas.Placement(root, sidedir)
+        extra = {subject.env + "_ROOT": root, subject.env + "_SIDE": sidedir}
+        d = root
+    path = subject.subject(d)
     total = per * each * len(cmds)
     started = time.perf_counter()
-    readers = [(l, spawn(subject.env, c, "reader", path, total)) for l, c in cmds.items()]
-    writers = [(l, spawn(subject.env, c, "writer", path, each)) for l, c in cmds.items() for _ in range(per)]
+    readers = [(l, spawn(subject.env, c, "reader", path, total, extra)) for l, c in cmds.items()]
+    writers = [(l, spawn(subject.env, c, "writer", path, each, extra)) for l, c in cmds.items() for _ in range(per)]
     codes = [(l, p.wait()) for l, p in writers]
     got, want = subject.final(path), subject.want(total)
     faults = [] if got == want else ["final value %r, wanted %r" % (got, want)]
@@ -101,8 +108,14 @@ def one_run(subject, cmds, where, i):
     seconds = time.perf_counter() - started
     left = os.listdir(os.path.dirname(path))
     faults += [l + " exit %d" % c for l, c in codes if c]
-    if len(left) != 2:
+    if sidedir is None and len(left) != 2:
         faults.append("%d entries beside the file" % len(left))
+    if sidedir is not None:
+        name = os.path.basename(path)
+        if left != [name]:
+            faults.append("root holds %r" % left)
+        if os.listdir(sidedir) != [name + ".lock"]:
+            faults.append("side holds %r" % os.listdir(sidedir))
     print("run %d: %s in %.1f s%s" % (i, "ok" if not faults else "FAILED", seconds, "".join("; " + f for f in faults)))
     return not faults
 
@@ -110,13 +123,17 @@ def one_run(subject, cmds, where, i):
 def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     subject = JobRecord() if "--job" in argv else Counter()
+    side = "--side" in argv
+    if side and "--job" in argv:
+        sys.exit("--side places the cas counter's lock and staging in a side directory; the job store has no placement")
     runs = int(args[0]) if args else 3
     where = args[1] if len(args) > 1 else None
     with tempfile.TemporaryDirectory() as build:
         cmds = subject.commands(build)
-        green = sum(one_run(subject, cmds, where or build, i + 1) for i in range(runs))
-    print("%s %s: %d of %d runs green; %d writers x %d in go, c++, python, one reader per language, in %s" % (
-        sys.platform, subject.name, green, runs, per * len(cmds), each, where or "a temporary directory"))
+        green = sum(one_run(subject, cmds, where or build, i + 1, side) for i in range(runs))
+    print("%s %s: %d of %d runs green; %d writers x %d in go, c++, python, one reader per language, in %s%s" % (
+        sys.platform, subject.name, green, runs, per * len(cmds), each, where or "a temporary directory",
+        ", lock and staging in a side directory" if side else ""))
     return 0 if green == runs else 1
 
 

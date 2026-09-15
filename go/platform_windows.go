@@ -8,12 +8,35 @@ import (
 )
 
 const (
-	accessDenied     syscall.Errno = 5
-	sharingViolation syscall.Errno = 32
-	exclusiveLock                  = 2
+	accessDenied       syscall.Errno = 5
+	sharingViolation   syscall.Errno = 32
+	exclusiveLock                    = 2
+	fileReadAttributes               = 0x80
 )
 
+// volumeOf is the volume serial number of the directory's volume.
+func volumeOf(dir string) (uint64, error) {
+	name, err := syscall.UTF16PtrFromString(dir)
+	if err != nil {
+		return 0, err
+	}
+	h, err := syscall.CreateFile(name, fileReadAttributes, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
+		nil, syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return 0, &os.PathError{Op: "open", Path: dir, Err: err}
+	}
+	defer syscall.CloseHandle(h)
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(h, &info); err != nil {
+		return 0, &os.PathError{Op: "volume", Path: dir, Err: err}
+	}
+	return uint64(info.VolumeSerialNumber), nil
+}
+
 var lockFileEx = syscall.NewLazyDLL("kernel32.dll").NewProc("LockFileEx")
+
+// syncDir is a no-op on Windows: Go flushes the directory on POSIX only.
+func syncDir(string) error { return nil }
 
 func openBoundedRecord(root *os.Root, name string) (*os.File, error) { return root.Open(name) }
 

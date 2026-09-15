@@ -1,8 +1,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <abstraction/cas.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <optional>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
@@ -31,6 +36,12 @@ extern char** environ;
 namespace fs = std::filesystem;
 using namespace abstraction::cas;
 
+// Defined in cas.cpp for this test only.
+namespace abstraction::cas::testing {
+extern void (*after_stage)(const std::filesystem::path& staged);
+extern void (*after_directory_sync)(const std::filesystem::path& directory);
+}
+
 static int failures = 0;
 
 static void check(bool cond, const std::string& what, const std::string& why = "") {
@@ -56,13 +67,46 @@ static std::string increment(const Value& cur) {
     return std::to_string(n) + " " + std::to_string(n);
 }
 
+static fs::path env_path(const char* name) {
+#ifdef _WIN32
+    std::wstring wide(name, name + std::strlen(name));
+    const wchar_t* p = _wgetenv(wide.c_str());
+#else
+    const char* p = std::getenv(name);
+#endif
+    return p ? fs::path(p) : fs::path();
+}
+
+static void set_env(const char* name, const fs::path& value) {
+#ifdef _WIN32
+    std::wstring wide(name, name + std::strlen(name));
+    SetEnvironmentVariableW(wide.c_str(), value.empty() ? nullptr : value.c_str());
+#else
+    if (value.empty()) unsetenv(name);
+    else setenv(name, value.c_str(), 1);
+#endif
+}
+
 static int role(const std::string& name, const fs::path& path, int target) {
     try {
+        std::optional<Placement> placement;
+        if (fs::path side = env_path("CAS_SIDE"); !side.empty()) placement.emplace(env_path("CAS_ROOT"), side);
         if (name == "writer") {
-            for (int i = 0; i < target; ++i) change(path, increment);
-        } else if (name == "reader") {
-            while (counter(read(path)) != target) {
+            for (int i = 0; i < target; ++i) {
+                if (placement) placement->change(path, increment);
+                else change(path, increment);
             }
+        } else if (name == "reader") {
+            while (counter(placement ? placement->read(path) : read(path)) != target) {
+            }
+        } else if (name == "killed") {
+            // Stage one change, leave the marker, and wait to be killed before the rename.
+            testing::after_stage = [](const fs::path&) {
+                std::ofstream(env_path("CAS_MARKER")) << "staged";
+                std::this_thread::sleep_for(std::chrono::seconds(120));
+            };
+            if (placement) placement->change(path, increment);
+            else change(path, increment);
         }
         return 0;
     } catch (const std::exception& e) {
@@ -263,14 +307,193 @@ static void an_ended_record_stays_ended() {
     fs::remove_all(dir);
 }
 
-static fs::path subject() {
-#ifdef _WIN32
-    const wchar_t* p = _wgetenv(L"CAS_PATH");
-#else
-    const char* p = std::getenv("CAS_PATH");
-#endif
-    return p ? fs::path(p) : fs::path();
+static std::string files(const fs::path& dir) {
+    std::vector<std::string> found;
+    for (const auto& e : fs::recursive_directory_iterator(dir)) {
+        if (e.is_regular_file()) found.push_back(e.path().lexically_relative(dir).generic_string());
+    }
+    std::sort(found.begin(), found.end());
+    std::string out;
+    for (const auto& f : found) out += (out.empty() ? "" : ",") + f;
+    return out;
 }
+
+static void placement_keeps_locks_and_staging_out_of_root() {
+    fs::path dir = fresh_dir();
+    Placement store(dir / "root", dir / "side");
+    fs::path p = store.root() / "host" / "ns" / "model" / "latest";
+    store.write(p, std::nullopt, "1");
+    bool refused = false;
+    try {
+        store.write(p, std::nullopt, "2");
+    } catch (const Moved&) {
+        refused = true;
+    }
+    check(refused, "a placement refuses a stale base");
+    store.change(p, [](const Value& cur) { return *cur + "!"; });
+    check(store.read(p) == "1!", "a placement reads what it wrote");
+    check(files(store.root()) == "host/ns/model/latest", "root holds only the data file", files(store.root()));
+    check(files(store.side()) == "host/ns/model/latest.lock", "side holds the lock", files(store.side()));
+    fs::remove_all(dir);
+}
+
+static bool outside(const Placement& store, const fs::path& p) {
+    try {
+        store.write(p, std::nullopt, "x");
+        return false;
+    } catch (const OutsideRoot&) {
+        return true;
+    }
+}
+
+static void placement_refuses_what_it_does_not_cover() {
+    fs::path dir = fresh_dir();
+    Placement store(dir / "root", dir / "side");
+    check(outside(store, store.root()), "a placement refuses its root");
+    check(outside(store, dir / "elsewhere"), "a placement refuses a path outside root");
+    check(outside(store, store.side() / "x"), "a placement refuses a path in side");
+    check(outside(store, store.root() / ".." / "escape"), "a placement refuses a path escaping root");
+    bool contains = false;
+    try {
+        Placement bad(store.root(), dir);
+    } catch (const std::invalid_argument&) {
+        contains = true;
+    }
+    check(contains, "a side directory containing root is refused");
+    fs::remove_all(dir);
+}
+
+static void placement_refuses_a_real_second_volume() {
+    fs::path dir = fresh_dir();
+    std::vector<fs::path> candidates;
+#ifdef _WIN32
+    for (char c = 'A'; c <= 'Z'; ++c) candidates.push_back(std::string(1, c) + ":\\");
+#else
+    candidates = {"/dev/shm", "/run"};
+#endif
+    for (const fs::path& other : candidates) {
+        std::error_code ec;
+        if (!fs::is_directory(other, ec)) continue;
+        try {
+            Placement same(dir / "root", other);
+        } catch (const CrossVolume&) {
+            check(true, "a side directory on another volume is refused");
+            fs::remove_all(dir);
+            return;
+        } catch (const std::exception&) {
+        }
+    }
+    std::printf("  SKIP  no second volume on this machine\n");
+    fs::remove_all(dir);
+}
+
+static void placement_loses_no_update_across_processes() {
+    fs::path dir = fresh_dir();
+    Placement store(dir / "root", dir / "side");
+    fs::path p = store.root() / "sub" / "n";
+    const int writers = 4, each = 100;
+    set_env("CAS_PATH", p);
+    set_env("CAS_ROOT", store.root());
+    set_env("CAS_SIDE", store.side());
+    Child reader = spawn("reader", writers * each);
+    std::vector<Child> ws;
+    for (int w = 0; w < writers; ++w) ws.push_back(spawn("writer", each));
+    bool clean = true;
+    for (Child w : ws) clean = join(w) == 0 && clean;
+    if (!clean) kill(reader);
+    check(clean, "every placement writer process finished");
+    check(join(reader) == 0, "the placement reader saw the final value");
+    int got = counter(store.read(p));
+    check(got == writers * each, "no lost update across processes through a placement",
+          std::to_string(got) + " of " + std::to_string(writers * each) + " survived");
+    check(files(store.root()) == "sub/n", "contention leaves nothing in root", files(store.root()));
+    check(files(store.side()) == "sub/n.lock", "contention leaves only the lock in side", files(store.side()));
+    set_env("CAS_ROOT", fs::path());
+    set_env("CAS_SIDE", fs::path());
+    fs::remove_all(dir);
+}
+
+static std::vector<std::pair<fs::path, Value>> synced;
+
+static void directory_is_synced_after_the_rename() {
+    fs::path dir = fresh_dir(), p = dir / "v";
+    static fs::path watched;
+    watched = p;
+    synced.clear();
+    testing::after_directory_sync = [](const fs::path& d) { synced.emplace_back(d, read(watched)); };
+    write(p, std::nullopt, "first");
+    testing::after_directory_sync = nullptr;
+    check(synced.size() == 1, "one directory sync per write", std::to_string(synced.size()));
+    check(!synced.empty() && synced[0].first == p.parent_path(), "the target's directory is synced");
+    check(!synced.empty() && synced[0].second == "first", "the directory is synced after the rename");
+    fs::remove_all(dir);
+}
+
+static void sweep_removes_only_staged_files() {
+    fs::path dir = fresh_dir(), p = dir / "n";
+    write(p, std::nullopt, "1 1");
+    for (const char* name : {"n.4242.tmp", "n.a_b9.tmp", "m.123.tmp", "n.lock.123.tmp", "n.x.y.tmp", "n.tmp"}) {
+        std::ofstream(dir / name) << "x";
+    }
+    check(sweep(p) == 2, "sweep removes the staged files of the path");
+    check(files(dir) == "m.123.tmp,n,n.lock,n.lock.123.tmp,n.tmp,n.x.y.tmp", "sweep leaves other names alone", files(dir));
+    check(sweep(p) == 0, "a second sweep finds nothing");
+    fs::remove_all(dir);
+}
+
+static bool wait_for(const fs::path& marker) {
+    for (int i = 0; i < 3000; ++i) {
+        std::error_code ec;
+        if (fs::exists(marker, ec)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+static void killed_writer(bool placed) {
+    fs::path dir = fresh_dir();
+    std::optional<Placement> store;
+    fs::path p = dir / "n";
+    if (placed) {
+        store.emplace(dir / "root", dir / "side");
+        p = store->root() / "m" / "latest";
+    }
+    auto do_write = [&](const Value& base, const std::string& data) {
+        if (store) store->write(p, base, data); else write(p, base, data);
+    };
+    do_write(std::nullopt, "1 1");
+    fs::path marker = dir / "staged.marker";
+    set_env("CAS_PATH", p);
+    set_env("CAS_MARKER", marker);
+    set_env("CAS_ROOT", placed ? store->root() : fs::path());
+    set_env("CAS_SIDE", placed ? store->side() : fs::path());
+    Child child = spawn("killed", 1);
+    bool staged = wait_for(marker);
+    kill(child);
+    join(child);
+    set_env("CAS_ROOT", fs::path());
+    set_env("CAS_SIDE", fs::path());
+    set_env("CAS_MARKER", fs::path());
+    std::string label = placed ? "placement: " : "beside: ";
+    check(staged, label + "the killed writer staged before it was killed");
+    check((store ? store->read(p) : read(p)) == "1 1", label + "a killed writer leaves the previous value");
+    if (placed) {
+        check(files(store->root()) == "m/latest", label + "root holds only the data file", files(store->root()));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (store) store->change(p, increment); else change(p, increment);
+    check((store ? store->read(p) : read(p)) == "2 2", label + "the killed writer's lock was released");
+    int gone = store ? store->sweep(p) : sweep(p);
+    check(gone == 1, label + "sweep removes the killed writer's staged file", std::to_string(gone));
+    if (placed) {
+        check(files(store->side()) == "m/latest.lock", label + "side holds only the lock after the sweep", files(store->side()));
+    } else {
+        check(files(dir) == "n,n.lock,staged.marker", label + "only the file, its lock and the marker remain", files(dir));
+    }
+    fs::remove_all(dir);
+}
+
+static fs::path subject() { return env_path("CAS_PATH"); }
 
 int main() {
     if (const char* name = std::getenv("CAS_ROLE")) {
@@ -286,5 +509,13 @@ int main() {
     no_lost_update_in_process();
     no_lost_update_across_processes();
     an_ended_record_stays_ended();
+    placement_keeps_locks_and_staging_out_of_root();
+    placement_refuses_what_it_does_not_cover();
+    placement_refuses_a_real_second_volume();
+    placement_loses_no_update_across_processes();
+    directory_is_synced_after_the_rename();
+    sweep_removes_only_staged_files();
+    killed_writer(false);
+    killed_writer(true);
     return failures == 0 ? 0 : 1;
 }

@@ -1,7 +1,6 @@
 """Compare-and-set over a file. Semantics in abstraction-cas/README.md."""
 
 import contextlib
-import glob
 import os
 import sys
 import tempfile
@@ -20,11 +19,16 @@ class Reentrant(Exception):
     """A write or change ran inside an edit on the same file."""
 
 
+class OutsideRoot(ValueError):
+    """A Placement was given its root, a path outside it, or a path in its side directory."""
+
+
+class CrossVolume(OSError):
+    """A Placement's side directory is on another volume than its root."""
+
+
 def read(path):
-    try:
-        return _read(_native(path))
-    except FileNotFoundError:
-        return None
+    return _read_native(_native(path))
 
 
 def write(path, base, data):
@@ -33,11 +37,7 @@ def write(path, base, data):
 
 
 def change(path, edit):
-    with _locked(path):
-        cur = read(path)
-        nxt = edit(cur)
-        if nxt != cur:
-            _replace(path, cur, nxt)
+    _change_at(_beside(path), edit)
 
 
 def sweep(path):
@@ -47,10 +47,119 @@ def sweep(path):
     directory. Holding the lock is what makes it safe: a live writer stages
     under the lock, so every temporary beside the file is a dead one.
     """
-    with _locked(path):
-        native = _native(path)
+    return _sweep_at(_beside(path))
+
+
+class Placement:
+    """The lock file and staged replacements of every file under root, kept in side.
+
+    side is a directory on root's volume, so root holds only data files. For
+    root/a/b the lock is side/a/b.lock, and a replacement is staged as
+    side/a/b.<unique>.tmp before it is renamed over root/a/b. Every writer of a
+    file must use the same placement: a writer beside the file takes another
+    lock and excludes nobody.
+    """
+
+    def __init__(self, root, side):
+        self.root = os.path.abspath(os.fspath(root))
+        self.side = os.path.abspath(os.fspath(side))
+        if _relative(self.side, self.root) is not None:
+            raise ValueError("cas: side directory %s contains root %s" % (self.side, self.root))
+        for directory in (self.root, self.side):
+            os.makedirs(_native(directory), exist_ok=True)
+        if _volume(_native(self.root)) != _volume(_native(self.side)):
+            raise CrossVolume("cas: side directory %s is on another volume than root %s" % (self.side, self.root))
+
+    def read(self, path):
+        return _read_native(self._place(path).target)
+
+    def write(self, path, base, data):
+        placed = self._place(path)
+        with _locked_at(placed):
+            _replace_at(placed, base, data)
+
+    def change(self, path, edit):
+        _change_at(self._place(path), edit)
+
+    def sweep(self, path):
+        """Remove the temporaries a killed writer left in side for path; return how many."""
+        return _sweep_at(self._place(path))
+
+    def _place(self, path):
+        target = os.path.abspath(os.fspath(path))
+        rel = _relative(self.root, target)
+        if rel is None or rel == os.curdir or _relative(self.side, target) is not None:
+            raise OutsideRoot("cas: %s is not a file under %s outside %s" % (target, self.root, self.side))
+        mirror = _native(os.path.join(self.side, rel))
+        return _Placed(_native(target), mirror + ".lock", os.path.dirname(mirror))
+
+
+class _Placed:
+    """The files one write uses: the data file, its lock and the directory its replacement is staged in."""
+
+    __slots__ = ("target", "lock", "stage")
+
+    def __init__(self, target, lock, stage):
+        self.target, self.lock, self.stage = target, lock, stage
+
+
+def _beside(path):
+    native = _native(path)
+    return _Placed(native, native + ".lock", os.path.dirname(native))
+
+
+def _relative(parent, child):
+    """child relative to parent, or None when child is neither parent nor under it."""
+    try:
+        rel = os.path.relpath(child, parent)
+    except ValueError:
+        return None
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None
+    return rel
+
+
+def _volume(directory):
+    return os.stat(directory).st_dev
+
+
+def _read_native(native):
+    try:
+        return _read(native)
+    except FileNotFoundError:
+        return None
+
+
+def _change_at(placed, edit):
+    with _locked_at(placed):
+        cur = _read_native(placed.target)
+        nxt = edit(cur)
+        if nxt != cur:
+            _replace_at(placed, cur, nxt)
+
+
+_UNIQUE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+def _staged_name(name, prefix):
+    """Whether name is <prefix><unique>.tmp with a unique part of letters, digits
+    and underscores: the names mkstemp, Go's CreateTemp and the C++ writer give a
+    replacement. A dot in the unique part belongs to another file's name, such as
+    <path>.lock.<unique>.tmp."""
+    suffix = ".tmp"
+    if len(name) <= len(prefix) + len(suffix) or not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    return all(c in _UNIQUE for c in name[len(prefix):-len(suffix)])
+
+
+def _sweep_at(placed):
+    with _locked_at(placed):
+        prefix = os.path.basename(placed.target) + "."
         gone = 0
-        for orphan in glob.glob(glob.escape(native) + ".*.tmp"):
+        for name in os.listdir(placed.stage):
+            orphan = os.path.join(placed.stage, name)
+            if not _staged_name(name, prefix) or not os.path.isfile(orphan):
+                continue
             with contextlib.suppress(OSError):
                 os.unlink(orphan)
                 gone += 1
@@ -60,39 +169,46 @@ def sweep(path):
 _held = threading.local()
 
 
-@contextlib.contextmanager
 def _locked(path):
-    native = _native(path)
+    return _locked_at(_beside(path))
+
+
+@contextlib.contextmanager
+def _locked_at(placed):
     holding = getattr(_held, "paths", None)
     if holding is None:
         holding = _held.paths = set()
-    if native in holding:
-        raise Reentrant(os.fspath(path))
-    os.makedirs(os.path.dirname(native), exist_ok=True)
-    fd = os.open(native + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
-    holding.add(native)
+    if placed.target in holding:
+        raise Reentrant(placed.target)
+    os.makedirs(os.path.dirname(placed.target), exist_ok=True)
+    os.makedirs(os.path.dirname(placed.lock), exist_ok=True)
+    fd = os.open(placed.lock, os.O_CREAT | os.O_RDWR, 0o600)
+    holding.add(placed.target)
     try:
         _flock(fd)
         yield
     finally:
-        holding.discard(native)
+        holding.discard(placed.target)
         os.close(fd)
 
 
 def _replace(path, base, data):
+    _replace_at(_beside(path), base, data)
+
+
+def _replace_at(placed, base, data):
     if data is None:
-        raise NoValue(os.fspath(path))
-    if read(path) != base:
-        raise Moved(os.fspath(path))
-    native = _native(path)
-    directory = os.path.dirname(native)
-    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(native) + ".", suffix=".tmp", dir=directory)
+        raise NoValue(placed.target)
+    if _read_native(placed.target) != base:
+        raise Moved(placed.target)
+    directory = os.path.dirname(placed.target)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(placed.target) + ".", suffix=".tmp", dir=placed.stage)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        _rename_over(tmp, native)
+        _rename_over(tmp, placed.target)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
