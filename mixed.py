@@ -1,4 +1,4 @@
-"""Writers of all three languages on one file, a counter or a job record. A lock they do not share shows as a lost update; a rename they read differently shows as a torn read."""
+"""Writers of all three languages on one CAS counter file. A lock they do not share shows as a lost update; a rename they read differently shows as a torn read."""
 
 import os
 import subprocess
@@ -7,9 +7,7 @@ import tempfile
 import time
 
 here = os.path.dirname(os.path.abspath(__file__))
-repo = os.path.dirname(here)
 sys.path.insert(0, os.path.join(here, "python"))
-sys.path.insert(0, os.path.join(repo, "abstraction-job", "python"))
 import abstraction_cas as cas
 
 per, each = 2, 100
@@ -54,32 +52,6 @@ class Counter:
         return b"%d %d" % (total, total)
 
 
-class JobRecord:
-    name, env = "job", "JOB"
-
-    def commands(self, build):
-        return {
-            "cpp": [cpp("JOB_CPP", "test_job_store")],
-            "go": [go_test_binary(build, os.path.join(repo, "abstraction-job", "go")), "-test.run=^$"],
-            "python": [sys.executable, os.path.join(repo, "abstraction-job", "python", "test_abstraction_job.py")],
-        }
-
-    def subject(self, d):
-        import abstraction_job as job
-        store = job.FileStore(d)
-        jid = store.submit(job.Record(id="", kind="mixed", spec={"writers": per * 3}))
-        store.claim(jid, "mixed", 3600)
-        return os.path.join(d, "jobs", jid + ".json")
-
-    def final(self, path):
-        import abstraction_job as job
-        store = job.FileStore(os.path.dirname(os.path.dirname(path)))
-        return store.load(os.path.basename(path)[: -len(".json")]).progress.done
-
-    def want(self, total):
-        return total
-
-
 def spawn(prefix, cmd, role, path, n, extra):
     env = dict(os.environ, **{prefix + "_PATH": path, prefix + "_ROLE": role, prefix + "_N": str(n)}, **extra)
     return subprocess.Popen(cmd, env=env)
@@ -122,10 +94,8 @@ def one_run(subject, cmds, where, i, side):
 
 def main(argv):
     args = [a for a in argv if not a.startswith("--")]
-    subject = JobRecord() if "--job" in argv else Counter()
+    subject = Counter()
     side = "--side" in argv
-    if side and "--job" in argv:
-        sys.exit("--side places the cas counter's lock and staging in a side directory; the job store has no placement")
     runs = int(args[0]) if args else 3
     where = args[1] if len(args) > 1 else None
     with tempfile.TemporaryDirectory() as build:

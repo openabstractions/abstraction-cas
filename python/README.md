@@ -46,6 +46,7 @@ edit saw what the first run wrote.
 | call | what it does |
 |---|---|
 | `read(path)` | the whole file, or `None` when there is none |
+| `read(path, timeout=s)` | the same read, raising `Refused` (a `TimeoutError` chained to the last `PermissionError`) when the file still refuses every open after `s` seconds |
 | `write(path, base, data)` | replace the file only if it still holds `base`. `None` as `base` means "only if it does not exist"; otherwise `Moved` |
 | `change(path, edit)` | read, edit and write under the lock. `edit` takes the current bytes (or `None`) and returns the new ones |
 | `sweep(path)` | remove the temporaries a killed writer left beside `path`; returns how many |

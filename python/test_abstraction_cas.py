@@ -57,6 +57,64 @@ class CasTest(unittest.TestCase):
     def path(self, name):
         return os.path.join(self.dir.name, name)
 
+    @unittest.skipUnless(sys.platform == "win32", "delete-pending state is Windows")
+    def test_a_read_waits_out_a_pending_delete(self):
+        """Opening a delete-pending file answers access denied, the state a rename
+        briefly leaves behind. A reader that failed on it died in mixed.py."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        p = self.path("n\U0001F600-状態")
+        write(p, None, b"before")
+        h = k32.CreateFileW(p, 0x00010000 | 0x80000000, 0x7, None, 3, 0, None)
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value)
+        disposition = ctypes.c_ubyte(1)
+        self.assertTrue(k32.SetFileInformationByHandle(h, 4, ctypes.byref(disposition), 1))
+        with self.assertRaises(PermissionError):
+            open(p, "rb").close()
+        closer = threading.Timer(0.03, k32.CloseHandle, (h,))
+        closer.start()
+        try:
+            self.assertIsNone(read(p))
+        finally:
+            closer.join()
+
+    @unittest.skipUnless(sys.platform == "win32", "delete-pending state is Windows")
+    def test_a_read_denied_past_its_timeout_is_refused(self):
+        """A file denied for as long as the reader waits raises Refused at the
+        reader's timeout, chained to the denial. The delete-pending handle stays
+        open past the timeout, so every open answers access denied, the answer a
+        read-denied file gives."""
+        import ctypes
+        import time
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        p = self.path("denied")
+        write(p, None, b"before")
+        h = k32.CreateFileW(p, 0x00010000 | 0x80000000, 0x7, None, 3, 0, None)
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value)
+        disposition = ctypes.c_ubyte(1)
+        try:
+            self.assertTrue(k32.SetFileInformationByHandle(h, 4, ctypes.byref(disposition), 1))
+            start = time.monotonic()
+            with self.assertRaises(abstraction_cas.Refused) as refused:
+                read(p, timeout=0.2)
+            elapsed = time.monotonic() - start
+        finally:
+            k32.CloseHandle(h)
+        self.assertIsInstance(refused.exception.__cause__, PermissionError)
+        self.assertLess(elapsed, 0.5)
+
     def test_stale_write_is_refused(self):
         p = self.path("v")
         with self.assertRaises(Moved):

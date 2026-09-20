@@ -39,6 +39,14 @@ Placed beside(const fs::path& path) {
 
 #ifdef _WIN32
 
+// FileRenameInfoEx is a Windows 10 declaration. MinGW's headers default to an
+// older _WIN32_WINNT and hide it; rename_over falls back to MoveFileExW where a
+// running system refuses it. Workflows compile this file by its path with no
+// build file, so the target is set here, where every build sees it.
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -53,7 +61,7 @@ using Err = DWORD;
 const DWORD share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 [[noreturn]] void fail(const char* op, const fs::path& p, Err e) {
-    throw std::system_error(int(e), std::system_category(), std::string(op) + " " + p.string());
+    throw std::system_error(int(e), std::system_category(), std::string(op) + " " + abstraction::cas::utf8(p));
 }
 
 struct Handle {
@@ -68,10 +76,29 @@ Handle open_shared(const fs::path& p, DWORD access, DWORD disposition = OPEN_EXI
     return Handle(CreateFileW(p.c_str(), access, share_all, nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr));
 }
 
-Value read_file(const fs::path& p) {
-    Handle f = open_shared(p, GENERIC_READ);
+bool transient(Err e);
+
+// A read races every writer's rename. While a replaced file is being deleted,
+// or another process holds it without FILE_SHARE_DELETE for an instant, opening
+// its name answers ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION. The writer
+// already retries its rename on those; the reader did not, and a spinning C++
+// reader in mixed.py died on one about one run in three on a loaded Windows host.
+// A reader's deadline, when given, ends the retry early with Refused.
+HANDLE open_for_read(const fs::path& p, Err& e, const std::chrono::steady_clock::time_point* deadline) {
+    for (int tries = 0;; ++tries) {
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, share_all, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) return h;
+        e = GetLastError();
+        if (!transient(e) || tries >= 2000) return h;
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) throw abstraction::cas::Refused(p, int(e));
+        if (tries >= 50) Sleep(1);
+    }
+}
+
+Value read_file(const fs::path& p, const std::chrono::steady_clock::time_point* deadline = nullptr) {
+    Err e = 0;
+    Handle f(open_for_read(p, e, deadline));
     if (!f.open()) {
-        Err e = GetLastError();
         if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return std::nullopt;
         fail("open", p, e);
     }
@@ -154,7 +181,7 @@ namespace {
 using Err = int;
 
 [[noreturn]] void fail(const char* op, const fs::path& p, Err e) {
-    throw std::system_error(e, std::generic_category(), std::string(op) + " " + p.string());
+    throw std::system_error(e, std::generic_category(), std::string(op) + " " + abstraction::cas::utf8(p));
 }
 
 struct Handle {
@@ -165,7 +192,8 @@ struct Handle {
     bool open() const { return fd >= 0; }
 };
 
-Value read_file(const fs::path& p) {
+// POSIX has no transient denial to retry, so the deadline changes nothing.
+Value read_file(const fs::path& p, const std::chrono::steady_clock::time_point* = nullptr) {
     Handle f(::open(p.c_str(), O_RDONLY | O_CLOEXEC));
     if (!f.open()) {
         if (errno == ENOENT) return std::nullopt;
@@ -293,7 +321,7 @@ int sweep_placed(const Placed& p) {
         std::error_code removed;
         if (fs::remove(entry.path(), removed)) ++gone;
     }
-    if (ec) throw std::system_error(ec, "sweep " + dir.string());
+    if (ec) throw std::system_error(ec, "sweep " + abstraction::cas::utf8(dir));
     return gone;
 }
 
@@ -334,6 +362,8 @@ namespace abstraction::cas {
 
 Value read(const fs::path& path) { return read_file(path); }
 
+Value read(const fs::path& path, std::chrono::steady_clock::time_point deadline) { return read_file(path, &deadline); }
+
 void write(const fs::path& path, const Value& base, const std::string& data) {
     Placed p = beside(path);
     Lock held = lock(p);
@@ -346,7 +376,7 @@ int sweep(const fs::path& path) { return sweep_placed(beside(path)); }
 
 Placement::Placement(const fs::path& root, const fs::path& side) : root_(clean(root)), side_(clean(side)) {
     if (relative_within(side_, root_))
-        throw std::invalid_argument("cas: side directory " + side_.string() + " contains root " + root_.string());
+        throw std::invalid_argument("cas: side directory " + utf8(side_) + " contains root " + utf8(root_));
     fs::create_directories(root_);
     fs::create_directories(side_);
     if (volume_of(root_) != volume_of(side_)) throw CrossVolume(root_, side_);

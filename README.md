@@ -1,13 +1,18 @@
 # abstraction-cas
 
-**In development.** No capability claim, no contract page, no conformance
-scenario of its own. Tags exist and no version number is typed on this page:
-[the tag list](https://github.com/openabstractions/abstraction-cas/tags) is the
-answer to "which release", because a tag is the only thing that cannot drift.
+Keep one small shared state file correct when several processes or programming
+languages update it. A killed writer leaves the previous complete value, and
+two writers cannot silently overwrite each other's changes. `Read` returns the
+whole value, `Write` replaces the value only when it still matches, and `Change`
+edits under the shared operating-system lock.
 
-A file is replaced whole or not at all, and every change is applied to the value
-the previous change left — across processes and across languages sharing one
-kernel.
+This is a direct provider utility in Go, Python and C++. It has no discoverable
+service contract. Applications normally use the capability service whose
+provider composes CAS.
+
+**In development.** No capability claim, contract page or standalone
+conformance scenario. Pin a reviewed entry from
+[the tag list](https://github.com/openabstractions/abstraction-cas/tags).
 
 ## The problem
 
@@ -64,6 +69,15 @@ err := cas.Change(path, func(cur []byte) ([]byte, error) {
     return json.Marshal(f)
 })
 ```
+
+A read on Windows retries an open that answers access denied or a sharing
+violation, because a writer's replace gives those answers for an instant. A
+file whose read is denied for good gives them on every try, and the retry ends
+after 2000 tries, several seconds. A reader with a deadline passes it:
+`ReadContext(ctx, path)` and `ReadLimitContext(ctx, path, max)` in Go return
+`ErrRefused` (wrapping the context's error and the last denial) once `ctx` ends,
+`read(path, timeout=s)` in Python raises `Refused`, and `read(path, deadline)`
+in C++ throws `Refused`, a `std::system_error` carrying the last answer.
 
 `Read` returns the whole file, or `nil` when there is none. `Write(path, base,
 data)` replaces the file only if it still holds `base` (`nil`: only if it does

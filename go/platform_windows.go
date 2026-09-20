@@ -10,6 +10,8 @@ import (
 const (
 	accessDenied       syscall.Errno = 5
 	sharingViolation   syscall.Errno = 32
+	lockViolation      syscall.Errno = 33
+	failImmediately                  = 1
 	exclusiveLock                    = 2
 	fileReadAttributes               = 0x80
 )
@@ -51,4 +53,16 @@ func flock(f *os.File) error {
 		return &os.PathError{Op: "lock", Path: f.Name(), Err: e}
 	}
 	return nil
+}
+
+func tryFlock(f *os.File) (bool, error) {
+	var ov syscall.Overlapped
+	r, _, e := lockFileEx.Call(f.Fd(), failImmediately|exclusiveLock, 0, 1, 0, uintptr(unsafe.Pointer(&ov)))
+	if r != 0 {
+		return true, nil
+	}
+	if errors.Is(e, lockViolation) {
+		return false, nil
+	}
+	return false, &os.PathError{Op: "lock", Path: f.Name(), Err: e}
 }

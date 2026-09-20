@@ -493,6 +493,79 @@ static void killed_writer(bool placed) {
     fs::remove_all(dir);
 }
 
+#ifdef _WIN32
+// A read that meets a file whose deletion is pending waits for the name to
+// settle. Opening a delete-pending file answers ERROR_ACCESS_DENIED, which is
+// the state a rename briefly leaves behind; the reader used to throw on it, and
+// its message then failed to convert a non-ANSI name.
+static void a_read_waits_out_a_pending_delete() {
+    fs::path dir = fresh_dir(), p = dir / fs::u8path("n\xF0\x9F\x98\x80-\xE7\x8A\xB6\xE6\x85\x8B");
+    write(p, std::nullopt, "before");
+    HANDLE h = CreateFileW(p.c_str(), DELETE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    const bool pending = h != INVALID_HANDLE_VALUE &&
+                         SetFileInformationByHandle(h, FileDispositionInfo, &disposition, sizeof disposition);
+    DWORD direct = 0;
+    if (pending) {
+        HANDLE probe = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        direct = probe == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+    }
+    check(pending && direct == ERROR_ACCESS_DENIED, "a delete-pending file refuses a plain open",
+          std::to_string(direct));
+    std::thread settle([h] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CloseHandle(h);
+    });
+    std::string what;
+    Value got = std::string("unread");
+    try {
+        got = read(p);
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    settle.join();
+    check(what.empty() && !got, "a read waits out a pending delete and finds the name gone", what);
+    fs::remove_all(dir);
+}
+
+// A file denied for as long as the reader waits refuses with Refused at the
+// reader's deadline. The delete-pending handle stays open past the deadline, so
+// every open answers ERROR_ACCESS_DENIED, the answer a read-denied file gives.
+static void a_read_denied_past_its_deadline_is_refused() {
+    fs::path dir = fresh_dir(), p = dir / "denied";
+    write(p, std::nullopt, "before");
+    HANDLE h = CreateFileW(p.c_str(), DELETE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    const bool pending = h != INVALID_HANDLE_VALUE &&
+                         SetFileInformationByHandle(h, FileDispositionInfo, &disposition, sizeof disposition);
+    check(pending, "a delete-pending file holds its name", std::to_string(GetLastError()));
+    const auto budget = std::chrono::milliseconds(200);
+    const auto start = std::chrono::steady_clock::now();
+    std::string what;
+    int code = 0;
+    bool refused = false;
+    try {
+        read(p, start + budget);
+    } catch (const Refused& e) {
+        refused = true;
+        code = e.code().value();
+        what = e.what();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    check(refused && code == ERROR_ACCESS_DENIED, "a read denied past its deadline throws Refused with the denial", what);
+    check(elapsed < budget + std::chrono::milliseconds(300), "a denied read returns at its deadline",
+          std::to_string(elapsed.count()) + " ms");
+    fs::remove_all(dir);
+}
+#endif
+
 static fs::path subject() { return env_path("CAS_PATH"); }
 
 int main() {
@@ -517,5 +590,9 @@ int main() {
     sweep_removes_only_staged_files();
     killed_writer(false);
     killed_writer(true);
+#ifdef _WIN32
+    a_read_waits_out_a_pending_delete();
+    a_read_denied_past_its_deadline_is_refused();
+#endif
     return failures == 0 ? 0 : 1;
 }

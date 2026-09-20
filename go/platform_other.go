@@ -27,6 +27,17 @@ func transient(error) bool { return false }
 
 func flock(f *os.File) error { return syscall.Flock(int(f.Fd()), syscall.LOCK_EX) }
 
+func tryFlock(f *os.File) (bool, error) {
+	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return false, nil
+	}
+	return false, err
+}
+
 // volumeOf is the device number of the directory's file system.
 func volumeOf(dir string) (uint64, error) {
 	var st syscall.Stat_t

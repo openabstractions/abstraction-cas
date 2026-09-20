@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	cas "github.com/openabstractions/abstraction-cas/go"
 )
 
@@ -17,10 +18,16 @@ func (s BoundedFileStore) Read(path string) (Value, error) {
 	return Value{Data: data}, err
 }
 func (s BoundedFileStore) Write(path string, base Value, data []byte) error {
+	return s.WriteContext(context.Background(), path, base, data)
+}
+
+// WriteContext compares and replaces one bounded value after acquiring its
+// native CAS lock within ctx.
+func (s BoundedFileStore) WriteContext(ctx context.Context, path string, base Value, data []byte) error {
 	if data == nil {
 		return cas.ErrNoValue
 	}
-	return cas.ChangeLimit(path, s.MaxBytes, func(current []byte) ([]byte, error) {
+	return cas.ChangeLimitContext(ctx, path, s.MaxBytes, func(current []byte) ([]byte, error) {
 		if (current == nil) != (base.Data == nil) || !bytes.Equal(current, base.Data) {
 			return nil, cas.ErrMoved
 		}

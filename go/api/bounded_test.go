@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	cas "github.com/openabstractions/abstraction-cas/go"
 	"os"
@@ -55,5 +56,18 @@ func TestBoundedStorePresenceAndAtomicRefusal(t *testing.T) {
 	got, _ = os.ReadFile(path)
 	if string(got) != "too large" {
 		t.Fatal("refusal changed bytes")
+	}
+}
+
+func TestBoundedFileStoreWriteContextHonoursCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bounded")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := (BoundedFileStore{MaxBytes: 8}).WriteContext(ctx, path, Value{}, []byte("value"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled write: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cancelled write created the value: %v", err)
 	}
 }

@@ -762,12 +762,12 @@ func Decode(in []byte) (*Value, error) {
 	return v, nil
 }
 
-// Refusals is in the order two of them are chosen between.
+// refusals is in the order two of them are chosen between.
 
-var Refusals = []string{"malformed", "bad_string", "number_spelling", "wrong_type", "bad_binary", "depth_exceeded", "duplicate_key", "duplicate_field", "unknown_field", "missing_field", "trailing_bytes"}
+var refusals = []string{"malformed", "bad_string", "number_spelling", "wrong_type", "bad_binary", "depth_exceeded", "duplicate_key", "duplicate_field", "unknown_field", "missing_field", "trailing_bytes"}
 
-func RefusalRank(word string) int {
-	for i, w := range Refusals {
+func refusalRank(word string) int {
+	for i, w := range refusals {
 		if w == word {
 			return i
 		}
@@ -854,6 +854,6 @@ func (r *reader) binary() ([]byte, error) {
 }
 
 type Store interface{
-Read(string)(Value,error)
-Write(string,Value,[]byte)error
+Read(path string)(Value,error)
+Write(path string, base Value, data []byte)error
 }

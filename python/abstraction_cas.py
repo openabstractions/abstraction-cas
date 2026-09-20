@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 
 
 class Moved(Exception):
@@ -27,8 +28,20 @@ class CrossVolume(OSError):
     """A Placement's side directory is on another volume than its root."""
 
 
-def read(path):
-    return _read_native(_native(path))
+class Refused(TimeoutError):
+    """Opening the file answered access denied or a sharing violation until the
+    reader's timeout. The last answer is the exception's __cause__."""
+
+
+def read(path, timeout=None):
+    """The whole file, or None when there is none.
+
+    A writer's replace denies an open for an instant, so a denied open is
+    retried. With timeout in seconds, a file still denied when it ends raises
+    Refused; without one the retry ends after its try count.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    return _read_native(_native(path), deadline)
 
 
 def write(path, base, data):
@@ -123,11 +136,23 @@ def _volume(directory):
     return os.stat(directory).st_dev
 
 
-def _read_native(native):
-    try:
-        return _read(native)
-    except FileNotFoundError:
-        return None
+def _read_native(native, deadline=None):
+    # A read races every writer's rename. While a replaced file is being deleted,
+    # opening its name on Windows answers access denied or a sharing violation;
+    # the rename already retries those, and the read does too, until its try
+    # count or the reader's deadline ends.
+    for tries in range(2001):
+        try:
+            return _read(native)
+        except FileNotFoundError:
+            return None
+        except _TRANSIENT as denied:
+            if tries == 2000:
+                raise
+            if deadline is not None and time.monotonic() >= deadline:
+                raise Refused("cas: %s refused every open until the reader's timeout" % native) from denied
+            if tries >= 50:
+                time.sleep(0.001)
 
 
 def _change_at(placed, edit):

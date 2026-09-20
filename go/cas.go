@@ -2,12 +2,15 @@ package cas
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 var ErrMoved = errors.New("cas: the file changed since it was read")
@@ -26,8 +29,33 @@ func ReadLimit(path string, maxBytes int64) ([]byte, error) {
 	}
 	return readLimit(path, maxBytes)
 }
+
+// ErrRefused reports a file whose open kept answering access denied or a
+// sharing violation until the caller's context ended. The error also wraps the
+// context's error and the last open error.
+var ErrRefused = errors.New("cas: the file refused every open until the caller's deadline")
+
+// ReadContext is Read with its retry of a denied open bounded by ctx. A writer's
+// replace denies an open for an instant, and a file denied for good is denied
+// on every retry; ctx decides how long the read waits before ErrRefused.
+func ReadContext(ctx context.Context, path string) ([]byte, error) {
+	return readLimitContext(ctx, path, 0)
+}
+
+// ReadLimitContext is ReadLimit with its retry of a denied open bounded by ctx.
+func ReadLimitContext(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
+		return nil, errors.New("cas: invalid read limit")
+	}
+	return readLimitContext(ctx, path, maxBytes)
+}
+
 func readLimit(path string, maxBytes int64) ([]byte, error) {
-	b, err := readFileLimit(path, maxBytes)
+	return readLimitContext(context.Background(), path, maxBytes)
+}
+
+func readLimitContext(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	b, err := readFileLimit(ctx, path, maxBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -46,16 +74,23 @@ func Change(path string, edit func(cur []byte) ([]byte, error)) error {
 // ChangeLimit bounds initial and compare reads under the existing edit lock,
 // and refuses an oversized replacement before staging it.
 func ChangeLimit(path string, maxBytes int64, edit func([]byte) ([]byte, error)) error {
+	return ChangeLimitContext(context.Background(), path, maxBytes, edit)
+}
+
+// ChangeLimitContext is ChangeLimit with lock acquisition and comparison reads
+// bounded by ctx. Cancellation before replacement leaves the value unchanged.
+// Once replacement starts, the call waits for its synchronous filesystem result.
+func ChangeLimitContext(ctx context.Context, path string, maxBytes int64, edit func([]byte) ([]byte, error)) error {
 	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
 		return errors.New("cas: invalid read limit")
 	}
-	return change(path, func(cur []byte) ([]byte, error) {
+	return changeAtContext(ctx, beside(path), func(cur []byte) ([]byte, error) {
 		next, err := edit(cur)
 		if err == nil && int64(len(next)) > maxBytes {
 			return nil, ErrTooLarge
 		}
 		return next, err
-	}, func(path string) ([]byte, error) { return ReadLimit(path, maxBytes) })
+	}, func(ctx context.Context, path string) ([]byte, error) { return ReadLimitContext(ctx, path, maxBytes) })
 }
 func change(path string, edit func([]byte) ([]byte, error), read func(string) ([]byte, error)) error {
 	return changeAt(beside(path), edit, read)
@@ -100,6 +135,32 @@ func changeAt(pl placed, edit func([]byte) ([]byte, error), read func(string) ([
 	return writeReadAt(pl, cur, next, read)
 }
 
+func changeAtContext(ctx context.Context, pl placed, edit func([]byte) ([]byte, error), read func(context.Context, string) ([]byte, error)) error {
+	unlock, err := lockAtContext(ctx, pl)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	cur, err := read(ctx, pl.target)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	next, err := edit(cur)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if same(cur, next) {
+		return nil
+	}
+	return writeReadAtContext(ctx, pl, cur, next, read)
+}
+
 func same(a, b []byte) bool { return (a == nil) == (b == nil) && bytes.Equal(a, b) }
 
 func lock(path string) (func(), error) { return lockAt(beside(path)) }
@@ -119,6 +180,42 @@ func lockAt(pl placed) (func(), error) {
 		return nil, err
 	}
 	return func() { f.Close() }, nil
+}
+
+func lockAtContext(ctx context.Context, pl placed) (func(), error) {
+	if ctx.Done() == nil {
+		return lockAt(pl)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, dir := range []string{filepath.Dir(pl.target), filepath.Dir(pl.lock)} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.OpenFile(pl.lock, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		acquired, err := tryFlock(f)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		if acquired {
+			return func() { f.Close() }, nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			f.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func write(path string, base, data []byte) error { return writeReadAt(beside(path), base, data, Read) }
@@ -204,18 +301,72 @@ func writeReadAt(pl placed, base, data []byte, read func(string) ([]byte, error)
 	return syncParent(filepath.Dir(pl.target))
 }
 
-func readFile(path string) ([]byte, error) { return readFileLimit(path, 0) }
-func readFileLimit(path string, maxBytes int64) ([]byte, error) {
+func writeReadAtContext(ctx context.Context, pl placed, base, data []byte, read func(context.Context, string) ([]byte, error)) error {
+	if data == nil {
+		return ErrNoValue
+	}
+	cur, err := read(ctx, pl.target)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !same(cur, base) {
+		return ErrMoved
+	}
+	tmp, err := stageIn(pl.stage, filepath.Base(pl.target), data)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if afterStage != nil {
+		afterStage(tmp)
+	}
+	if err := ctx.Err(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := retry(func() error { return rename(tmp, pl.target) }); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return syncParent(filepath.Dir(pl.target))
+}
+
+func readFile(path string) ([]byte, error) { return readFileLimit(context.Background(), path, 0) }
+
+// readFileLimit reads path, bounded by maxBytes when positive, and retries a
+// denied open until its try count or ctx ends.
+func readFileLimit(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
 	root, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
 	var f *os.File
-	if maxBytes > 0 {
-		f, err = openBoundedRecord(root, filepath.Base(path))
-	} else {
-		f, err = root.Open(filepath.Base(path))
+	// A read races every writer's rename. While a replaced file is being
+	// deleted, opening its name answers access denied or a sharing violation;
+	// the rename already retries those, and the read does too, until its try
+	// count or the caller's context ends.
+	for tries := 0; ; tries++ {
+		if maxBytes > 0 {
+			f, err = openBoundedRecord(root, filepath.Base(path))
+		} else {
+			f, err = root.Open(filepath.Base(path))
+		}
+		if err == nil || !transient(err) || tries >= 2000 {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: %w: %w", ErrRefused, ctx.Err(), err)
+		}
+		if tries >= 50 {
+			time.Sleep(time.Millisecond)
+		}
 	}
 	if err != nil {
 		return nil, err

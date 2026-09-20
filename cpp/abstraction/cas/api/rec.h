@@ -15,6 +15,23 @@ namespace abstraction::cas::api {
 
 using Raw = std::string;
 
+class Refusal : public std::runtime_error {
+public:
+    Refusal(const char* word, std::size_t offset)
+        : std::runtime_error(std::string("refused: ") + word + " at byte " + std::to_string(offset)),
+          word(word),
+          offset(offset) {}
+    const char* word;
+    std::size_t offset;
+};
+
+struct Value {
+    std::optional<std::vector<std::uint8_t>> data;
+};
+
+// Codec machinery. Nothing here is API; it may change in any release.
+namespace detail {
+
 inline void esc(std::string& out, const std::string& s);
 
 inline void esc_byte(std::string& out, unsigned char c) {
@@ -56,6 +73,8 @@ inline void strs(std::string& out, const std::vector<std::string>& v, int depth)
     pad(out, depth);
     out += ']';
 }
+
+
 
 inline bool ws(unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
@@ -134,10 +153,7 @@ inline void esc(std::string& out, const std::string& s) {
 
 inline std::string encode_binary(const std::vector<std::uint8_t>&);
 inline std::vector<std::uint8_t> decode_binary(const std::string&);
-
-struct Value {
-    std::optional<std::vector<std::uint8_t>> data;
-};
+inline void enc_value(std::string&, const Value&, int);
 
 inline void enc_value(std::string& out, const Value& v, int depth) {
     out += '{';
@@ -154,25 +170,8 @@ inline void enc_value(std::string& out, const Value& v, int depth) {
     out += '}';
 }
 
-inline std::string encode(const Value& v) {
-    std::string out;
-    enc_value(out, v, 0);
-    out += '\n';
-    return out;
-}
-
 inline constexpr int kDepthLimit = 64;
 inline constexpr std::size_t kI64Digits = 19;
-
-class Refusal : public std::runtime_error {
-public:
-    Refusal(const char* word, std::size_t offset)
-        : std::runtime_error(std::string("refused: ") + word + " at byte " + std::to_string(offset)),
-          word(word),
-          offset(offset) {}
-    const char* word;
-    std::size_t offset;
-};
 
 inline void append_rune(std::string& out, std::uint32_t cp) {
     if (cp < 0x80) {
@@ -502,24 +501,6 @@ inline Value decode_value(Reader& r) {
     return v;
 }
 
-inline Value decode(std::string_view data) {
-    Reader r{data};
-    r.skip_ws();
-    Value v = decode_value(r);
-    r.skip_ws();
-    if (r.pos < r.buf.size()) r.refuse("trailing_bytes");
-    return v;
-}
-
-// kRefusals is in the order two of them are chosen between.
-inline const std::vector<std::string> kRefusals = {"malformed", "bad_string", "number_spelling", "wrong_type", "bad_binary", "depth_exceeded", "duplicate_key", "duplicate_field", "unknown_field", "missing_field", "trailing_bytes"};
-
-inline int refusal_rank(std::string_view word) {
-    for (std::size_t i = 0; i < kRefusals.size(); ++i)
-        if (kRefusals[i] == word) return static_cast<int>(i);
-    return -1;
-}
-
 inline std::string encode_binary(const std::vector<std::uint8_t>& value){
  const char* alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
  std::string out;
@@ -542,9 +523,38 @@ inline std::vector<std::uint8_t> decode_binary(const std::string& text){
  if(encode_binary(out)!=text)refuse("bad_binary");return out;
 }
 
+}  // namespace detail
+
+inline std::string encode(const Value& v) {
+    std::string out;
+    detail::enc_value(out, v, 0);
+    out += '\n';
+    return out;
+}
+
+inline Value decode(std::string_view data) {
+    detail::Reader r{data};
+    r.skip_ws();
+    Value v = detail::decode_value(r);
+    r.skip_ws();
+    if (r.pos < r.buf.size()) r.refuse("trailing_bytes");
+    return v;
+}
+
+namespace detail {
+// kRefusals is in the order two of them are chosen between.
+inline const std::vector<std::string> kRefusals = {"malformed", "bad_string", "number_spelling", "wrong_type", "bad_binary", "depth_exceeded", "duplicate_key", "duplicate_field", "unknown_field", "missing_field", "trailing_bytes"};
+
+inline int refusal_rank(std::string_view word) {
+    for (std::size_t i = 0; i < kRefusals.size(); ++i)
+        if (kRefusals[i] == word) return static_cast<int>(i);
+    return -1;
+}
+}  // namespace detail
+
 struct Store{virtual ~Store()=default;
-virtual Value Read(const std::string& arg0)=0;
-virtual void Write(const std::string& arg0,const Value& arg1,const std::vector<std::uint8_t>& arg2)=0;
+virtual Value read(const std::string& path)=0;
+virtual void write(const std::string& path,const Value& base,const std::vector<std::uint8_t>& data)=0;
 };
 
 }  // namespace abstraction::cas::api

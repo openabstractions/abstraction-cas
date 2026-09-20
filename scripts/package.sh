@@ -50,8 +50,9 @@
 #            command builds that zip from the published repository, adding
 #            the repository's root LICENSE unasked; no checkout here can
 #            reproduce it, so it is checked where it exists.
-#   C++      cmake --install of .split/<repo>/cpp into scratch, for the five
-#            layers that carry a project() of their own.
+#   C++      cmake --install of .split/<repo>/cpp into scratch, for cas,
+#            storage and watch, the layers whose C++ package installs a
+#            library with pkg-config and licence metadata.
 #
 #   scripts/package.sh                   every language
 #   scripts/package.sh python go cpp     a subset
@@ -295,8 +296,6 @@ printf '\033[1mPython — wheel and sdist built from the published image\033[0m\
 py_pkgs='
 abstraction-cas cas
 abstraction-config config
-abstraction-download download
-abstraction-job job
 abstraction-model model
 abstraction-watch watch
 '
@@ -435,7 +434,7 @@ fi
 
 if want cpp; then
 printf '\n\033[1mC++ — cmake --install of the published layer, into scratch\033[0m\n'
-for repo in abstraction-cas abstraction-download abstraction-job abstraction-storage abstraction-watch; do
+for repo in abstraction-cas abstraction-storage abstraction-watch; do
     name="abstraction_${repo#abstraction-}"
     src="$SPLIT/$repo/cpp"
     if [ ! -f "$src/CMakeLists.txt" ]; then
