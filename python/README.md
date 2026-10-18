@@ -1,5 +1,7 @@
 # abstraction-cas, in Python
 
+*For Python applications.*
+
 Compare-and-set over a file, on the kernel's own lock. Two writers on one file do
 not lose each other's updates, and a writer killed halfway leaves the old file
 intact rather than half a new one. One module, standard library only, importing

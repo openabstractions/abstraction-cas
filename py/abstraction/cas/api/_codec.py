@@ -193,6 +193,17 @@ class _Reader:
     def string(self):
         if self.at() != _QUOTE:
             raise self.refuse("wrong_type")
+        # Most wire keys and values contain no escapes. Search and validate
+        # those bytes in C; retain the bytewise path for escapes and refusals.
+        end = self.buf.find(b'"', self.pos + 1)
+        if end >= 0:
+            chunk = self.buf[self.pos + 1:end]
+            if b"\\" not in chunk and (not chunk or min(chunk) >= 0x20):
+                self.pos = end + 1
+                try:
+                    return chunk.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise self.refuse("bad_string") from None
         self.pos += 1
         out = bytearray()
         while True:
@@ -497,39 +508,21 @@ _REFUSALS = ["malformed", "bad_string", "number_spelling", "wrong_type", "bad_bi
 def _refusal_rank(word):
     return _REFUSALS.index(word) if word in _REFUSALS else -1
 
+import base64
+import binascii
+
 def _encode_binary(value):
     if type(value) is not bytes:
         raise Refusal("wrong_type", 0)
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    out = []
-    for i in range(0, len(value), 3):
-        chunk = value[i:i+3]
-        v = int.from_bytes(chunk, "big") << (8 * (3-len(chunk)))
-        out.extend((alphabet[v >> 18], alphabet[(v >> 12) & 63], alphabet[(v >> 6) & 63] if len(chunk)>1 else "=", alphabet[v & 63] if len(chunk)>2 else "="))
-    return "".join(out)
+    return base64.b64encode(value).decode("ascii")
 
 def _decode_binary(text):
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     def bad():
         raise _Reader(b"").refuse("bad_binary")
-    if len(text) % 4: bad()
-    out = bytearray()
-    for i in range(0,len(text),4):
-        v, pad = 0, 0
-        for j,c in enumerate(text[i:i+4]):
-            if c == "=":
-                if j<2 or i+4 != len(text): bad()
-                pad += 1
-                digit = 0
-            else:
-                if pad: bad()
-                digit = alphabet.find(c)
-                if digit < 0: bad()
-            v = (v << 6) | digit
-        out.append(v >> 16)
-        if pad < 2: out.append((v >> 8) & 255)
-        if pad == 0: out.append(v & 255)
-    result = bytes(out)
+    try:
+        result = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        bad()
     if _encode_binary(result) != text: bad()
     return result
 

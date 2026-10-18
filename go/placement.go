@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	identity "github.com/openabstractions/abstraction-identity"
 )
 
 // ErrCrossVolume refuses a side directory on another volume than the root. A
@@ -41,13 +43,18 @@ func NewPlacement(root, side string) (*Placement, error) {
 	if err != nil {
 		return nil, err
 	}
-	if within(r, s) {
-		return nil, fmt.Errorf("cas: side directory %s contains root %s", s, r)
-	}
 	for _, dir := range []string{r, s} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
+	}
+	// Both exist now, so file identity decides whether side is or holds root
+	// (identity.SameFile, identity.Within).
+	if same, err := identity.SameFile(r, s); err != nil || same {
+		return nil, fmt.Errorf("cas: side directory %s contains root %s", s, r)
+	}
+	if inside, err := identity.Within(r, s); err != nil || inside {
+		return nil, fmt.Errorf("cas: side directory %s contains root %s", s, r)
 	}
 	rv, err := volumeID(r)
 	if err != nil {
@@ -111,24 +118,26 @@ func (p *Placement) place(path string) (placed, error) {
 	if err != nil {
 		return placed{}, err
 	}
-	rel, err := filepath.Rel(p.root, abs)
-	if err != nil || rel == "." || !within(abs, p.root) || within(abs, p.side) {
+	// Containment by file identity (identity.WithinRel): the mirrored lock and
+	// stage take the path's own place below root, whatever spelling reached it.
+	rel, inside, err := identity.WithinRel(abs, p.root)
+	if err != nil || !inside {
+		return placed{}, fmt.Errorf("%w: %s (root %s, side %s)", ErrOutsideRoot, path, p.root, p.side)
+	}
+	if aside, err := identity.Within(abs, p.side); err != nil || aside {
 		return placed{}, fmt.Errorf("%w: %s (root %s, side %s)", ErrOutsideRoot, path, p.root, p.side)
 	}
 	mirror := filepath.Join(p.side, rel)
 	return placed{target: abs, lock: mirror + ".lock", stage: filepath.Dir(mirror)}, nil
 }
 
-// within reports whether child is parent or lies under it.
-func within(child, parent string) bool {
-	rel, err := filepath.Rel(parent, child)
-	return err == nil && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// commonDir is the deepest directory holding both a and b.
+// commonDir is the deepest directory holding both a and b, by their
+// spelling: rename needs a folder both paths are spelled below, and the
+// placement builds both from its own root and side.
 func commonDir(a, b string) string {
 	for dir := a; ; dir = filepath.Dir(dir) {
-		if within(b, dir) || filepath.Dir(dir) == dir {
+		prefix := strings.TrimRight(dir, `/`+string(filepath.Separator)) + string(filepath.Separator)
+		if b == dir || strings.HasPrefix(b, prefix) || filepath.Dir(dir) == dir {
 			return dir
 		}
 	}

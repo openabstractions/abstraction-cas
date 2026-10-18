@@ -201,16 +201,19 @@ func lockAtContext(ctx context.Context, pl placed) (func(), error) {
 	for {
 		acquired, err := tryFlock(f)
 		if err != nil {
+			//unchecked: best-effort cleanup on a path that already returns a definite error
 			f.Close()
 			return nil, err
 		}
 		if acquired {
+			//unchecked: the returned unlock closure has no return value to report a close failure through
 			return func() { f.Close() }, nil
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			//unchecked: best-effort cleanup on a path that already returns a definite error
 			f.Close()
 			return nil, ctx.Err()
 		case <-timer.C:
@@ -320,6 +323,7 @@ func writeReadAtContext(ctx context.Context, pl placed, base, data []byte, read 
 		return err
 	}
 	if err := ctx.Err(); err != nil {
+		//unchecked: best-effort staged-temp-file cleanup on a path that already returns a definite error
 		os.Remove(tmp)
 		return err
 	}
@@ -327,10 +331,12 @@ func writeReadAtContext(ctx context.Context, pl placed, base, data []byte, read 
 		afterStage(tmp)
 	}
 	if err := ctx.Err(); err != nil {
+		//unchecked: best-effort staged-temp-file cleanup on a path that already returns a definite error
 		os.Remove(tmp)
 		return err
 	}
 	if err := retry(func() error { return rename(tmp, pl.target) }); err != nil {
+		//unchecked: best-effort staged-temp-file cleanup on a path that already returns a definite error
 		os.Remove(tmp)
 		return err
 	}

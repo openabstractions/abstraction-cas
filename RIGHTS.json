@@ -1,0 +1,14 @@
+{
+  "format": "openabstractions-rights@1",
+  "owner": "abstraction.cas",
+  "generated": "Do not edit. Run rights-catalogue --write from the existing compiled catalogue.",
+  "source": "github.com/openabstractions/abstraction-facade/go/grants",
+  "availability": "Compiled catalogue reference: served and selector support use the named receiving-service context. Connected-runtime discovery supplies current availability. Facade Applications is experimental. Definitions grant no access.",
+  "compiled_receivers": {
+    "credentials": true,
+    "application_logs": true
+  },
+  "coverage": "This projection has no named action definition for CAS (compare-and-set). Atomic shared-state updates and the composing service's admission remain with their existing owners.",
+  "definitions": [],
+  "bundles": []
+}

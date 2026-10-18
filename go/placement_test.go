@@ -105,6 +105,26 @@ func TestPlacementRefusesWhatItDoesNotCover(t *testing.T) {
 			t.Errorf("a side directory %s containing the root was accepted", side)
 		}
 	}
+	t.Run("root_alias_as_side", func(t *testing.T) {
+		alias := filepath.Join(base, "root-alias")
+		if err := os.Symlink(p.Root(), alias); err != nil {
+			t.Skipf("this account cannot make a directory link here: %v", err)
+		}
+		rootInfo, err := os.Stat(p.Root())
+		if err != nil {
+			t.Fatal(err)
+		}
+		aliasInfo, err := os.Stat(alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(rootInfo, aliasInfo) {
+			t.Fatal("the directory link does not name the placement root")
+		}
+		if _, err := NewPlacement(p.Root(), alias); err == nil {
+			t.Fatal("a root directory alias was accepted as the side directory")
+		}
+	})
 }
 
 func TestPlacementRefusesAnotherVolume(t *testing.T) {

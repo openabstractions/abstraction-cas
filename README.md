@@ -1,18 +1,17 @@
 # abstraction-cas
 
-Keep one small shared state file correct when several processes or programming
-languages update it. A killed writer leaves the previous complete value, and
-two writers cannot silently overwrite each other's changes. `Read` returns the
-whole value, `Write` replaces the value only when it still matches, and `Change`
-edits under the shared operating-system lock.
+*For provider authors. An application uses the capability service a
+provider composes CAS into.*
 
-This is a direct provider utility in Go, Python and C++. It has no discoverable
-service contract. Applications normally use the capability service whose
-provider composes CAS.
+CAS (compare-and-set) keeps one small shared state file correct when several
+processes or programming languages update it. A killed writer leaves the
+previous complete value, and two writers cannot silently overwrite each other's
+changes. `Read` returns the whole value, `Write` replaces the value only when it
+still matches, and `Change` edits under the shared operating-system lock.
 
-**In development.** No capability claim, contract page or standalone
-conformance scenario. Pin a reviewed entry from
-[the tag list](https://github.com/openabstractions/abstraction-cas/tags).
+**What's new here:** Processes in Go, Python and C++ update one small state
+file together without losing each other's writes, and a writer killed halfway
+leaves the previous complete value.
 
 ## The problem
 
@@ -22,6 +21,12 @@ service of ours hand-rolled its own writer. This is the floor under all of them:
 one lock, one rename, one implementation per language we ship. Not a
 layer — no contract page, no capability claim. A stranger implementing `job`
 needs its page, not this.
+
+The example is in [Example](#example).
+
+This is a direct provider utility in Go, Python and C++. It has no discoverable
+service contract. Applications normally use the capability service whose
+provider composes CAS.
 
 ## Words
 
@@ -39,6 +44,8 @@ No rule on this page carries a tag. The invariants below each carry a test, and
 [the job page](https://github.com/openabstractions/abstraction-job).
 
 ## Obtain
+
+Install the runtime first: https://openabstractions.org/adopt.html
 
 - **Go.** `go get github.com/openabstractions/abstraction-cas/go`.
   [Releases, newest first](https://github.com/openabstractions/abstraction-cas/tags);
@@ -296,6 +303,12 @@ hold an implementation to it.
 Go 1.25 or newer, standard library only. Python 3.9 or newer, standard library
 only. C++17.
 
+## Status
+
+**In development.** No capability claim, contract page or standalone
+conformance scenario. Pin a reviewed entry from
+[the tag list](https://github.com/openabstractions/abstraction-cas/tags).
+
 ## Licence
 
 Apache-2.0. See [LICENSE](https://github.com/openabstractions/abstraction-cas/blob/main/LICENSE).
@@ -331,3 +344,13 @@ Write propagates native Go `ErrMoved` and C++ `Moved` on comparison mismatch.
 The schema currently documents that error in prose: the generator does not yet
 support declared `exception`/`throws` types. Its RPC `ServiceError` mechanism
 is not emitted for this direct API and does not replace those native errors.
+
+<!-- BEGIN GENERATED PERMISSION DEFINITIONS -->
+
+## Permission definitions
+
+Generated from the existing compiled catalogue. [RIGHTS.json](RIGHTS.json) contains the complete action/profile records, disclosure, lifecycle, first-use behavior, selector support and finite bundles.
+
+This projection has no named action definition for CAS (compare-and-set). Atomic shared-state updates and the composing service's admission remain with their existing owners.
+
+<!-- END GENERATED PERMISSION DEFINITIONS -->
