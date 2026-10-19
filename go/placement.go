@@ -162,9 +162,15 @@ func (p *Placement) place(path string) (placed, error) {
 	// rename runs below root and side.
 	rel, inside, err := placementRelative(target, p.root)
 	if err != nil || !inside {
+		if err != nil {
+			return placed{}, fmt.Errorf("%w: %s (root %s, side %s): root resolution: %v", ErrOutsideRoot, path, p.root, p.side, err)
+		}
 		return placed{}, fmt.Errorf("%w: %s (root %s, side %s)", ErrOutsideRoot, path, p.root, p.side)
 	}
 	if _, aside, err := placementRelative(target, p.side); err != nil || aside {
+		if err != nil {
+			return placed{}, fmt.Errorf("%w: %s (root %s, side %s): side resolution: %v", ErrOutsideRoot, path, p.root, p.side, err)
+		}
 		return placed{}, fmt.Errorf("%w: %s (root %s, side %s)", ErrOutsideRoot, path, p.root, p.side)
 	}
 	// These are new mirror names, chosen from fileid's physical remainder.

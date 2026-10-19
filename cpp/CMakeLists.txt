@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(abstraction_cas LANGUAGES CXX VERSION 0.8.0)
+    project(abstraction_cas LANGUAGES CXX VERSION 0.8.1)
     set(ABSTRACTION_CAS_STANDALONE ON)
 else()
     set(ABSTRACTION_CAS_STANDALONE OFF)

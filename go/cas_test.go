@@ -179,13 +179,14 @@ func TestMissingToEmptyIsAChange(t *testing.T) {
 }
 
 func TestNoLostUpdateInProcess(t *testing.T) {
+	ctx := stressVolumeContext(t)
 	path := filepath.Join(t.TempDir(), "n")
 	const writers, each = 8, 50
 	var wg sync.WaitGroup
 	for range writers {
 		wg.Go(func() {
 			for range each {
-				if err := Change(path, increment); err != nil {
+				if err := retryStressVolume(ctx, func() error { return Change(path, increment) }); err != nil {
 					t.Error(err)
 					return
 				}
@@ -197,6 +198,7 @@ func TestNoLostUpdateInProcess(t *testing.T) {
 	if got := counter(b); got != writers*each {
 		t.Fatalf("%d of %d updates survived", got, writers*each)
 	}
+	t.Logf("all %d accepted updates survived", writers*each)
 }
 
 func TestNoLostUpdateAcrossProcesses(t *testing.T) {
