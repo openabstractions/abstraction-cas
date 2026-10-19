@@ -121,44 +121,43 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      # The file list, not a build file. This exact route was measured by hand
-      # under g++ and MSVC; the published CMakeLists.txt was dropped
-      # because it fetched a dependency these sources no longer use.
-      - name: compile and run
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          path: abstraction-cas
+          persist-credentials: false
+      - name: resolve released sibling versions
+        id: siblings
         run: |
-          CXX="$(command -v g++ || command -v clang++ || true)"
-          if [ -z "$CXX" ]; then
-            printf 'UNPROVEN  c++ on %s — neither g++ nor clang++ is on PATH, nothing was compiled\n' "$RUNNER_OS"
-            printf '%s: UNPROVEN c++, no g++ or clang++ on PATH\n' "$RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          "$CXX" --version | head -1
-          out=testbin
-          static=""
-          if [ "$RUNNER_OS" = Windows ]; then
-            out=testbin.exe
-            # Git Bash puts its own mingw64\bin ahead of the runner's C:\mingw64\bin,
-            # so a dynamically linked binary loads Git's older libstdc++-6.dll and
-            # dies in the loader before main: no output, no message, exit 127.
-            case "$("$CXX" --version | head -1)" in *g++*) static=-static ;; esac
-          fi
-          "$CXX" -std=c++17 -I cpp/include \
-            cpp/test/test_cas.cpp cpp/src/cas.cpp -o "$out" $static
-          code=0
-          "./$out" | tee out.txt || code=$?
-          n=$(grep -c PASS out.txt || true)
-          if [ "$n" -lt 1 ]; then
-            printf 'FAIL  the test binary printed no PASS line, and an empty run is not a pass\n'
+          version=$(awk '$1 == "github.com/openabstractions/abstraction-identity" {print $2}
+                         $1 == "require" && $2 == "github.com/openabstractions/abstraction-identity" {print $3}' abstraction-cas/go/go.mod)
+          if ! printf '%s\n' "$version" | grep -Ex 'v[0-9]+\.[0-9]+\.[0-9]+' >/dev/null; then
+            printf 'Expected a released abstraction-identity version in go/go.mod\n' >&2
             exit 1
           fi
-          if [ "$code" -ne 0 ]; then
-            printf 'FAIL  the run exited %s\n' "$code"
-            exit 1
-          fi
-          printf '%s: c++ %s, %s assertions\n' \
-            "$RUNNER_OS" "$("$CXX" --version | head -1)" "$n" >> "$GITHUB_STEP_SUMMARY"
+          printf 'identity=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: openabstractions/abstraction-identity
+          ref: ${{ steps.siblings.outputs.identity }}
+          path: abstraction-identity
+          persist-credentials: false
+      - name: build, install and test C++
+        run: |
+          prefix="$RUNNER_TEMP/cpp-install"
+          cmake -S abstraction-identity/cpp -B "$RUNNER_TEMP/identity-build" \
+            -DCMAKE_BUILD_TYPE=Release -DABSTRACTION_IPC_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --build "$RUNNER_TEMP/identity-build" --config Release
+          cmake --install "$RUNNER_TEMP/identity-build" --config Release
+          cmake -S abstraction-cas/cpp -B "$RUNNER_TEMP/layer-build" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$prefix" -DCMAKE_INSTALL_PREFIX="$prefix" -DABSTRACTION_BUILD_TESTS=ON
+          cmake --build "$RUNNER_TEMP/layer-build" --config Release
+          ctest --test-dir "$RUNNER_TEMP/layer-build" -C Release --output-on-failure --no-tests=error
+          cmake --install "$RUNNER_TEMP/layer-build" --config Release
+          cmake -S abstraction-cas/cpp/test/installed -B "$RUNNER_TEMP/consumer-build" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$prefix" \
+            -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF
+          cmake --build "$RUNNER_TEMP/consumer-build" --config Release
+          ctest --test-dir "$RUNNER_TEMP/consumer-build" -C Release --output-on-failure --no-tests=error
 
   unproven:
     needs: [go, python, cpp]
@@ -170,7 +169,6 @@ jobs:
           {
             printf '\n### UNPROVEN\n\nThis workflow builds what this repository contains, and nothing else. It ran none of:\n\n'
             printf -- '- the cross-language conformance harnesses, which compare bytes across all three languages and live in the private tree\n'
-            printf -- '- MSVC. The c++ job takes whichever of g++ or clang++ is on PATH, and this does not re-measure MSVC\n'
-            printf -- '- any signed or installed artefact\n'
+            printf -- '- any signed product artefact\n'
             printf -- '- delegation to a real BITS, launchd or NAS tier\n'
           } >> "$GITHUB_STEP_SUMMARY"

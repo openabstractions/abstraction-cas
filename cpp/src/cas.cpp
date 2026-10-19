@@ -1,5 +1,7 @@
 #include <abstraction/cas.h>
+#include <abstraction/fileid.h>
 
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <system_error>
@@ -7,6 +9,7 @@
 
 namespace fs = std::filesystem;
 using abstraction::cas::Value;
+namespace fileid=abstraction::fileid;
 
 // Test hooks. This layer's own tests set them; applications never do.
 namespace abstraction::cas::testing {
@@ -30,9 +33,10 @@ struct Placed {
 
 // The default placement: the lock and the staged file sit beside the data file.
 Placed beside(const fs::path& path) {
-    fs::path lock = path;
+    auto leaf=fileid::leaf(path);
+    fs::path lock = leaf.path();
     lock += ".lock";
-    return {path, lock, path.parent_path()};
+    return {leaf.path(), lock, leaf.folder};
 }
 
 }
@@ -124,12 +128,16 @@ fs::path stage(const Placed& p, const std::string& data) {
     fs::path tmp = fresh(p.stage, p.target.filename());
     Handle f(CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (!f.open()) fail("create", tmp, GetLastError());
-    DWORD n = 0;
-    if (!WriteFile(f.h, data.data(), DWORD(data.size()), &n, nullptr) || n != data.size() || !FlushFileBuffers(f.h)) {
-        Err e = GetLastError();
-        DeleteFileW(tmp.c_str());
-        fail("write", tmp, e);
+    auto discard=[&](const char* op,Err error){auto owned=f.h;f.h=INVALID_HANDLE_VALUE;CloseHandle(owned);DeleteFileW(tmp.c_str());fail(op,tmp,error);};
+    for(std::size_t done=0;done<data.size();) {
+        DWORD n=0,chunk=DWORD((std::min)(data.size()-done,std::size_t(65536)));
+        if(!WriteFile(f.h,data.data()+done,chunk,&n,nullptr))discard("write",GetLastError());
+        if(!n)discard("write",ERROR_WRITE_FAULT);
+        done+=n;
     }
+    if(!FlushFileBuffers(f.h))discard("sync",GetLastError());
+    auto owned=f.h;f.h=INVALID_HANDLE_VALUE;
+    if(!CloseHandle(owned)){auto error=GetLastError();DeleteFileW(tmp.c_str());fail("close",tmp,error);}
     return tmp;
 }
 
@@ -192,6 +200,18 @@ struct Handle {
     bool open() const { return fd >= 0; }
 };
 
+// macOS fsync leaves data in the drive cache; F_FULLFSYNC flushes it.
+// A volume that refuses F_FULLFSYNC with ENOTSUP gets the plain fsync, as in Go.
+int sync_file(int fd) {
+#ifdef F_FULLFSYNC
+    int r;
+    do r = fcntl(fd, F_FULLFSYNC); while (r != 0 && errno == EINTR);
+    if (r == 0) return 0;
+    if (errno != ENOTSUP) return -1;
+#endif
+    return fsync(fd);
+}
+
 // POSIX has no transient denial to retry, so the deadline changes nothing.
 Value read_file(const fs::path& p, const std::chrono::steady_clock::time_point* = nullptr) {
     Handle f(::open(p.c_str(), O_RDONLY | O_CLOEXEC));
@@ -230,7 +250,7 @@ fs::path stage(const Placed& p, const std::string& data) {
         }
         done += size_t(n);
     }
-    if (fsync(f.fd) != 0) {
+    if (sync_file(f.fd) != 0) {
         Err e = errno;
         unlink(tmp.c_str());
         fail("sync", tmp, e);
@@ -257,7 +277,7 @@ void sync_dir(const fs::path& dir) {
     const fs::path where = dir.empty() ? fs::path(".") : dir;
     Handle d(::open(where.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY));
     if (!d.open()) fail("open", where, errno);
-    if (fsync(d.fd) != 0 && errno != EINVAL && errno != ENOTSUP) fail("sync", where, errno);
+    if (sync_file(d.fd) != 0 && errno != EINVAL && errno != ENOTSUP) fail("sync", where, errno);
 }
 
 }
@@ -266,9 +286,25 @@ void sync_dir(const fs::path& dir) {
 
 namespace {
 
+// Retain the native target-entry deadlock fix without exporting migration APIs.
+// Only the pointer is thread-local; each record and its identity live on stack.
+struct Editing {
+    static thread_local Editing* current;
+    Editing* previous;
+    fileid::EntryID target;
+    explicit Editing(const fs::path& path) : previous(current), target(fileid::entry_id(path)) { current = this; }
+    ~Editing() { current = previous; }
+};
+thread_local Editing* Editing::current = nullptr;
+
 Lock lock(const Placed& p) {
     if (fs::path dir = p.target.parent_path(); !dir.empty()) fs::create_directories(dir);
     if (fs::path dir = p.lock.parent_path(); !dir.empty()) fs::create_directories(dir);
+    if (Editing::current) {
+        auto target = fileid::entry_id(p.target);
+        for (auto entry = Editing::current; entry; entry = entry->previous)
+            if (entry->target == target) throw std::logic_error("cas: reentrant mutation of the edited file");
+    }
     return Lock(p.lock);
 }
 
@@ -328,32 +364,22 @@ int sweep_placed(const Placed& p) {
 void change_placed(const Placed& p, const abstraction::cas::Edit& edit) {
     Lock held = lock(p);
     Value cur = read_file(p.target);
+    Editing editing(p.target);
     std::string next = edit(cur);
     if (cur != next) replace(p, cur, next);
 }
 
-fs::path clean(const fs::path& p) {
-    fs::path out = fs::absolute(p).lexically_normal();
-    if (!out.has_filename() && out.has_relative_path()) out = out.parent_path();
-    return out;
-}
-
-// child relative to parent, or nothing when child is neither parent nor under it.
-std::optional<fs::path> relative_within(const fs::path& parent, const fs::path& child) {
-    fs::path rel = child.lexically_relative(parent);
-    if (rel.empty()) return std::nullopt;
-    if (auto first = rel.begin(); first != rel.end() && *first == "..") return std::nullopt;
-    return rel;
-}
-
 Placed place(const fs::path& root, const fs::path& side, const fs::path& path) {
-    fs::path target = clean(path);
-    std::optional<fs::path> rel = relative_within(root, target);
-    if (!rel || *rel == "." || relative_within(side, target)) throw abstraction::cas::OutsideRoot(target, root);
-    fs::path mirror = side / *rel;
-    fs::path lock = mirror;
+    auto leaf=fileid::leaf(path);
+    fs::path target=leaf.path();
+    auto parent_rel=fileid::within(leaf.folder,root);
+    if(!parent_rel||fileid::within(leaf.folder,side))throw abstraction::cas::OutsideRoot(target,root);
+    auto rel=*parent_rel=="."?leaf.name:*parent_rel/leaf.name;
+    auto mirror = fileid::leaf(side / rel);
+    if(!fileid::within(mirror.folder,side))throw abstraction::cas::OutsideRoot(mirror.path(),side);
+    fs::path lock = mirror.path();
     lock += ".lock";
-    return {target, lock, mirror.parent_path()};
+    return {target, lock, mirror.folder};
 }
 
 }
@@ -374,11 +400,9 @@ void change(const fs::path& path, const Edit& edit) { change_placed(beside(path)
 
 int sweep(const fs::path& path) { return sweep_placed(beside(path)); }
 
-Placement::Placement(const fs::path& root, const fs::path& side) : root_(clean(root)), side_(clean(side)) {
-    if (relative_within(side_, root_))
+Placement::Placement(const fs::path& root, const fs::path& side) : root_(fileid::folder(root,true)), side_(fileid::folder(side,true)) {
+    if (fileid::within(root_,side_))
         throw std::invalid_argument("cas: side directory " + utf8(side_) + " contains root " + utf8(root_));
-    fs::create_directories(root_);
-    fs::create_directories(side_);
     if (volume_of(root_) != volume_of(side_)) throw CrossVolume(root_, side_);
 }
 

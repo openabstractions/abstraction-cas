@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	identity "github.com/openabstractions/abstraction-identity"
+	"github.com/openabstractions/abstraction-identity/fileid"
 )
 
 var ErrMoved = errors.New("cas: the file changed since it was read")
@@ -65,10 +69,20 @@ func readLimitContext(ctx context.Context, path string, maxBytes int64) ([]byte,
 	return b, err
 }
 
-func Write(path string, base, data []byte) error { return writeAt(beside(path), base, data) }
+func Write(path string, base, data []byte) error {
+	pl, err := beside(path)
+	if err != nil {
+		return err
+	}
+	return writeAt(pl, base, data)
+}
 
 func Change(path string, edit func(cur []byte) ([]byte, error)) error {
-	return change(path, edit, Read)
+	pl, err := beside(path)
+	if err != nil {
+		return err
+	}
+	return changeAt(pl, edit, Read)
 }
 
 // ChangeLimit bounds initial and compare reads under the existing edit lock,
@@ -84,7 +98,11 @@ func ChangeLimitContext(ctx context.Context, path string, maxBytes int64, edit f
 	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
 		return errors.New("cas: invalid read limit")
 	}
-	return changeAtContext(ctx, beside(path), func(cur []byte) ([]byte, error) {
+	pl, err := beside(path)
+	if err != nil {
+		return err
+	}
+	return changeAtContext(ctx, pl, func(cur []byte) ([]byte, error) {
 		next, err := edit(cur)
 		if err == nil && int64(len(next)) > maxBytes {
 			return nil, ErrTooLarge
@@ -92,8 +110,32 @@ func ChangeLimitContext(ctx context.Context, path string, maxBytes int64, edit f
 		return next, err
 	}, func(ctx context.Context, path string) ([]byte, error) { return ReadLimitContext(ctx, path, maxBytes) })
 }
-func change(path string, edit func([]byte) ([]byte, error), read func(string) ([]byte, error)) error {
-	return changeAt(beside(path), edit, read)
+
+// ReplaceLimit replaces a small record whose owner does not need its old
+// value. The limit applies to the new value, so an invalid old record can be
+// repaired without reading it. The replacement uses the same local path,
+// canonical lock and durable write as ChangeLimit.
+func ReplaceLimit(path string, maxBytes int64, data []byte) error {
+	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
+		return errors.New("cas: invalid write limit")
+	}
+	if data == nil {
+		return ErrNoValue
+	}
+	if int64(len(data)) > maxBytes {
+		return ErrTooLarge
+	}
+	pl, err := beside(path)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	unlock, err := lockAtContext(ctx, pl)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return replaceAtContext(ctx, pl, data)
 }
 
 // placed names the files one write uses: the data file, its lock file and the
@@ -101,9 +143,60 @@ func change(path string, edit func([]byte) ([]byte, error), read func(string) ([
 type placed struct{ target, lock, stage string }
 
 // beside is the default placement: the lock and the staged file sit beside the
-// data file.
-func beside(path string) placed {
-	return placed{target: path, lock: path + ".lock", stage: filepath.Dir(path)}
+// data file. Every spelling of one file names one lock, so writers through
+// different spellings exclude each other. The lock is keyed on the parent folder plus the leaf
+// (fileid.ResolveLeaf, CAS-L1): the folder is resolved through junctions,
+// symbolic links and 8.3 aliases to its final path, and the leaf reads as the
+// folder holds it, an 8.3 alias in its long form. The data file's own
+// identity is never the key, since every write renames a new file over it.
+// A folder that does not exist yet is created first, as the lock creates it.
+// The lock holds within one host, so a path off this host's local volumes, or
+// a folder reached through a link to one, is refused (LocalPath).
+func beside(path string) (placed, error) {
+	if err := LocalPath(path); err != nil {
+		return placed{}, err
+	}
+	leaf, err := leafOf(path, true)
+	if err != nil {
+		return placed{}, err
+	}
+	target := leaf.Path()
+	return placed{target: target, lock: target + ".lock", stage: leaf.Folder().Path()}, nil
+}
+
+// leafOf is fileid.ResolveLeaf of path in this process's view, and a refusal
+// named as the lock's. With create, a missing folder is created first, as
+// the lock creates it; without, a missing folder answers fs.ErrNotExist.
+func leafOf(path string, create bool) (fileid.Leaf, error) {
+	leaf, err := fileid.ResolveLeaf(context.Background(), fileid.Self, path)
+	if create && errors.Is(err, fs.ErrNotExist) {
+		pending, pendingErr := fileid.Pending(context.Background(), fileid.Self, path)
+		if pendingErr != nil {
+			return fileid.Leaf{}, pendingErr
+		}
+		if err := os.MkdirAll(filepath.Dir(pending.Path()), 0o700); err != nil {
+			return fileid.Leaf{}, err
+		}
+		leaf, err = fileid.ResolveLeaf(context.Background(), fileid.Self, path)
+	}
+	if errors.Is(err, identity.ErrNotLocalPath) {
+		return fileid.Leaf{}, fmt.Errorf("cas: the lock holds within one host: %w", err)
+	}
+	return leaf, err
+}
+
+// LocalPath reports whether Write, Change and Sweep, and a placement's root
+// and side, accept path (CAS-L2). The lock holds within one host, so a path
+// off this host's local volumes is refused with identity's reason; the error
+// matches errors.Is(err, identity.ErrNotLocalPath) and names the path once.
+// A store that writes through cas calls it where its root is configured, and
+// the refusal comes there, before the first write. A relative path is read
+// against the working folder, as Write reads it.
+func LocalPath(path string) error {
+	if err := identity.LocalPath(path); err != nil {
+		return fmt.Errorf("cas: the lock holds within one host: %w", err)
+	}
+	return nil
 }
 
 func writeAt(pl placed, base, data []byte) error {
@@ -163,7 +256,13 @@ func changeAtContext(ctx context.Context, pl placed, edit func([]byte) ([]byte, 
 
 func same(a, b []byte) bool { return (a == nil) == (b == nil) && bytes.Equal(a, b) }
 
-func lock(path string) (func(), error) { return lockAt(beside(path)) }
+func lock(path string) (func(), error) {
+	pl, err := beside(path)
+	if err != nil {
+		return nil, err
+	}
+	return lockAt(pl)
+}
 
 func lockAt(pl placed) (func(), error) {
 	for _, dir := range []string{filepath.Dir(pl.target), filepath.Dir(pl.lock)} {
@@ -182,8 +281,25 @@ func lockAt(pl placed) (func(), error) {
 	return func() { f.Close() }, nil
 }
 
+// LockContext holds the same native process lock used by CAS updates. Shared
+// holders may coexist; an exclusive holder excludes every shared holder. The
+// caller owns the path boundary and releases the lock after its whole operation.
+func LockContext(ctx context.Context, path string, shared bool) (func(), error) {
+	pl, err := beside(path)
+	if err != nil {
+		return nil, err
+	}
+	bounded, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return lockAtContextMode(bounded, pl, shared)
+}
+
 func lockAtContext(ctx context.Context, pl placed) (func(), error) {
-	if ctx.Done() == nil {
+	return lockAtContextMode(ctx, pl, false)
+}
+
+func lockAtContextMode(ctx context.Context, pl placed, shared bool) (func(), error) {
+	if ctx.Done() == nil && !shared {
 		return lockAt(pl)
 	}
 	if err := ctx.Err(); err != nil {
@@ -199,13 +315,17 @@ func lockAtContext(ctx context.Context, pl placed) (func(), error) {
 		return nil, err
 	}
 	for {
-		acquired, err := tryFlock(f)
+		acquired, err := tryFlockMode(f, shared)
 		if err != nil {
 			//unchecked: best-effort cleanup on a path that already returns a definite error
 			f.Close()
 			return nil, err
 		}
 		if acquired {
+			if err := ctx.Err(); err != nil {
+				f.Close()
+				return nil, err
+			}
 			//unchecked: the returned unlock closure has no return value to report a close failure through
 			return func() { f.Close() }, nil
 		}
@@ -221,23 +341,24 @@ func lockAtContext(ctx context.Context, pl placed) (func(), error) {
 	}
 }
 
-func write(path string, base, data []byte) error { return writeReadAt(beside(path), base, data, Read) }
-func writeRead(path string, base, data []byte, read func(string) ([]byte, error)) error {
-	return writeReadAt(beside(path), base, data, read)
-}
-
 // afterStage runs between staging and the rename. Tests set it to kill a writer
 // at that point.
 var afterStage func(tmp string)
 
 // syncParent flushes the directory whose entry the rename replaced. It is
-// syncDir; tests replace it to observe the call.
-var syncParent = syncDir
+// SyncDir; tests replace it to observe the call.
+var syncParent = SyncDir
 
 // Sweep removes the staged files a killed writer left beside path and returns
 // how many. It holds the lock, and a live writer stages under the lock, so
 // every staged file it finds is a dead writer's.
-func Sweep(path string) (int, error) { return sweepAt(beside(path)) }
+func Sweep(path string) (int, error) {
+	pl, err := beside(path)
+	if err != nil {
+		return 0, err
+	}
+	return sweepAt(pl)
+}
 
 func sweepAt(pl placed) (int, error) {
 	unlock, err := lockAt(pl)
@@ -318,6 +439,10 @@ func writeReadAtContext(ctx context.Context, pl placed, base, data []byte, read 
 	if !same(cur, base) {
 		return ErrMoved
 	}
+	return replaceAtContext(ctx, pl, data)
+}
+
+func replaceAtContext(ctx context.Context, pl placed, data []byte) error {
 	tmp, err := stageIn(pl.stage, filepath.Base(pl.target), data)
 	if err != nil {
 		return err
@@ -398,7 +523,9 @@ func readFileLimit(ctx context.Context, path string, maxBytes int64) ([]byte, er
 // rename replaces path with tmp through an os.Root at the deepest directory
 // holding both, which keeps the replace-with-POSIX-semantics rename when a
 // placement stages in another directory of the same volume.
-func rename(tmp, path string) error {
+func rename(tmp, path string) error { return renameFile(tmp, path) }
+
+func renameRoot(tmp, path string) error {
 	dir := filepath.Dir(path)
 	if filepath.Dir(tmp) != dir {
 		dir = commonDir(filepath.Dir(tmp), dir)
@@ -408,12 +535,18 @@ func rename(tmp, path string) error {
 		return err
 	}
 	defer root.Close()
-	from, err := filepath.Rel(dir, tmp)
-	if err != nil {
+	from, inside, err := physicalRelative(tmp, dir)
+	if err != nil || !inside {
+		if err == nil {
+			err = ErrOutsideRoot
+		}
 		return err
 	}
-	to, err := filepath.Rel(dir, path)
-	if err != nil {
+	to, inside, err := physicalRelative(path, dir)
+	if err != nil || !inside {
+		if err == nil {
+			err = ErrOutsideRoot
+		}
 		return err
 	}
 	return root.Rename(from, to)

@@ -17,6 +17,17 @@ func TestTheDirectoryIsSyncedAfterTheRename(t *testing.T) {
 	var calls []call
 	previous := syncParent
 	t.Cleanup(func() { syncParent = previous })
+	sameDirectory := func(a, b string) bool {
+		left, err := os.Stat(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		right, err := os.Stat(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return os.SameFile(left, right)
+	}
 
 	path := filepath.Join(t.TempDir(), "v")
 	syncParent = func(dir string) error {
@@ -27,7 +38,7 @@ func TestTheDirectoryIsSyncedAfterTheRename(t *testing.T) {
 	if err := Write(path, nil, []byte("first")); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 1 || calls[0].dir != filepath.Dir(path) || calls[0].value != "first" {
+	if len(calls) != 1 || !sameDirectory(calls[0].dir, filepath.Dir(path)) || calls[0].value != "first" {
 		t.Fatalf("directory syncs %+v, want one of %s after the rename", calls, filepath.Dir(path))
 	}
 
@@ -38,7 +49,7 @@ func TestTheDirectoryIsSyncedAfterTheRename(t *testing.T) {
 	if err := p.Write(placedPath, nil, []byte("placed")); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 1 || calls[0].dir != filepath.Dir(placedPath) || calls[0].value != "placed" {
+	if len(calls) != 1 || !sameDirectory(calls[0].dir, filepath.Dir(placedPath)) || calls[0].value != "placed" {
 		t.Fatalf("placement directory syncs %+v, want one of the target's directory", calls)
 	}
 }

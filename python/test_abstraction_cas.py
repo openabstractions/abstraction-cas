@@ -10,6 +10,8 @@ import unittest
 
 import abstraction_cas
 from abstraction_cas import Moved, NoValue, Reentrant, change, read, sweep, write
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from personfolders import setUpModule, tearDownModule  # noqa: E402,F401 (per-user folders in a stand-in)
 
 names = pathlib.Path(__file__).resolve().parent.parent / "names.list"
 
@@ -128,6 +130,52 @@ class CasTest(unittest.TestCase):
         write(p, b"1", b"2")
         self.assertEqual(read(p), b"2")
         self.assertEqual(len(os.listdir(self.dir.name)), 2, "refused writes left files behind")
+
+    @unittest.skipIf(sys.platform == "win32", "F_FULLFSYNC is POSIX fcntl")
+    def test_a_write_flushes_the_drive_cache_where_fcntl_can(self):
+        import errno
+        real = abstraction_cas.fcntl
+        calls = []
+
+        class Fake:
+            F_FULLFSYNC = 51
+            def __init__(self, refuse):
+                self.refuse = refuse
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def fcntl(self, fd, op):
+                calls.append(op)
+                if self.refuse:
+                    raise OSError(self.refuse, "refused")
+                return real.fcntl(fd, real.F_GETFD)
+
+        # One full flush on the staged file and one on the directory.
+        for refuse in (0, errno.ENOTSUP):
+            calls.clear()
+            abstraction_cas.fcntl = Fake(refuse)
+            try:
+                p = self.path("full%d" % refuse)
+                write(p, None, b"1")
+            finally:
+                abstraction_cas.fcntl = real
+            self.assertEqual(calls, [Fake.F_FULLFSYNC, Fake.F_FULLFSYNC])
+            self.assertEqual(read(p), b"1")
+
+        # A hard error fails the write and leaves the previous value alone.
+        for hard in (errno.EIO, errno.EINVAL):
+            p = self.path("hard%d" % hard)
+            write(p, None, b"1")
+            before = sorted(os.listdir(self.dir.name))
+            abstraction_cas.fcntl = Fake(hard)
+            try:
+                with self.assertRaises(OSError):
+                    write(p, b"1", b"2")
+            finally:
+                abstraction_cas.fcntl = real
+            self.assertEqual(sorted(os.listdir(self.dir.name)), before)
+            self.assertEqual(read(p), b"1")
 
     def test_missing_reads_as_none(self):
         p = self.path("v")

@@ -1,13 +1,15 @@
 package cas
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	identity "github.com/openabstractions/abstraction-identity"
+	"github.com/openabstractions/abstraction-identity/fileid"
 )
 
 // ErrCrossVolume refuses a side directory on another volume than the root. A
@@ -33,41 +35,61 @@ type Placement struct{ root, side string }
 var volumeID = volumeOf
 
 // NewPlacement creates root and side when they are missing. It refuses a side
-// directory that is or contains root, and one on another volume.
+// directory that is or contains root, one on another volume, and a root or
+// side off this host's local volumes (LocalPath), where the lock would hold
+// for this host only.
 func NewPlacement(root, side string) (*Placement, error) {
-	r, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
-	}
-	s, err := filepath.Abs(side)
-	if err != nil {
-		return nil, err
-	}
-	for _, dir := range []string{r, s} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+	for _, path := range []string{root, side} {
+		if err := LocalPath(path); err != nil {
 			return nil, err
 		}
 	}
-	// Both exist now, so file identity decides whether side is or holds root
-	// (identity.SameFile, identity.Within).
-	if same, err := identity.SameFile(r, s); err != nil || same {
-		return nil, fmt.Errorf("cas: side directory %s contains root %s", s, r)
-	}
-	if inside, err := identity.Within(r, s); err != nil || inside {
-		return nil, fmt.Errorf("cas: side directory %s contains root %s", s, r)
-	}
-	rv, err := volumeID(r)
+	r, err := placementFolder(root)
 	if err != nil {
 		return nil, err
 	}
-	sv, err := volumeID(s)
+	defer r.Close()
+	s, err := placementFolder(side)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	rp, sp := r.FileID().Path(), s.FileID().Path()
+	relation, err := r.Relate(s)
+	if err != nil || relation.Kind != fileid.RelationOutside {
+		return nil, fmt.Errorf("cas: side directory %s contains root %s", sp, rp)
+	}
+	rv, err := volumeID(rp)
+	if err != nil {
+		return nil, err
+	}
+	sv, err := volumeID(sp)
 	if err != nil {
 		return nil, err
 	}
 	if rv != sv {
-		return nil, fmt.Errorf("%w: root %s, side %s", ErrCrossVolume, r, s)
+		return nil, fmt.Errorf("%w: root %s, side %s", ErrCrossVolume, rp, sp)
 	}
-	return &Placement{root: r, side: s}, nil
+	return &Placement{root: rp, side: sp}, nil
+}
+
+func placementFolder(path string) (fileid.Handle, error) {
+	h, err := fileid.Open(context.Background(), fileid.Self, path, fileid.Options{})
+	if errors.Is(err, fs.ErrNotExist) {
+		pending, pendingErr := fileid.Pending(context.Background(), fileid.Self, path)
+		if pendingErr != nil {
+			return fileid.Handle{}, pendingErr
+		}
+		if err := os.MkdirAll(pending.Path(), 0o700); err != nil {
+			return fileid.Handle{}, err
+		}
+		h, err = fileid.Open(context.Background(), fileid.Self, path, fileid.Options{})
+	}
+	if err == nil && !h.FileID().IsDir() {
+		h.Close()
+		return fileid.Handle{}, fmt.Errorf("cas: %s is not a folder", path)
+	}
+	return h, err
 }
 
 // Root is the absolute directory whose files the placement covers.
@@ -114,21 +136,169 @@ func (p *Placement) Sweep(path string) (int, error) {
 }
 
 func (p *Placement) place(path string) (placed, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
+	if err := LocalPath(path); err != nil {
 		return placed{}, err
 	}
-	// Containment by file identity (identity.WithinRel): the mirrored lock and
-	// stage take the path's own place below root, whatever spelling reached it.
-	rel, inside, err := identity.WithinRel(abs, p.root)
+	// The leaf's final spelling, as beside keys it (fileid.ResolveLeaf): the
+	// folder after links and aliases, and the leaf as the folder holds it. A
+	// folder below root that does not exist yet holds no alias; WithinRel
+	// places it by its deepest existing folder.
+	var target string
+	switch leaf, err := leafOf(path, false); {
+	case err == nil:
+		target = leaf.Path()
+	case errors.Is(err, fs.ErrNotExist):
+		pending, err := fileid.Pending(context.Background(), fileid.Self, path)
+		if err != nil {
+			return placed{}, err
+		}
+		target = pending.Path()
+	case !errors.Is(err, fs.ErrNotExist):
+		return placed{}, err
+	}
+	// Containment by file identity: the data file, the
+	// mirrored lock and the stage take the path's own place below root,
+	// whatever spelling reached it, so every spelling names one lock and the
+	// rename runs below root and side.
+	rel, inside, err := placementRelative(target, p.root)
 	if err != nil || !inside {
 		return placed{}, fmt.Errorf("%w: %s (root %s, side %s)", ErrOutsideRoot, path, p.root, p.side)
 	}
-	if aside, err := identity.Within(abs, p.side); err != nil || aside {
+	if _, aside, err := placementRelative(target, p.side); err != nil || aside {
 		return placed{}, fmt.Errorf("%w: %s (root %s, side %s)", ErrOutsideRoot, path, p.root, p.side)
 	}
-	mirror := filepath.Join(p.side, rel)
-	return placed{target: abs, lock: mirror + ".lock", stage: filepath.Dir(mirror)}, nil
+	// These are new mirror names, chosen from fileid's physical remainder.
+	// Ask fileid to retain their literal Windows spelling, then use only its
+	// returned leaf/folder paths for the lock and staging directory.
+	mirrorInput := placementInput(p.side + string(filepath.Separator) + rel)
+	if err := mirrorFolder(parentSpelling(mirrorInput), p.side); err != nil {
+		return placed{}, err
+	}
+	mirror, err := leafOf(mirrorInput, false)
+	if err != nil {
+		return placed{}, err
+	}
+	if _, inside, err := physicalRelative(mirror.Path(), p.side); err != nil || !inside {
+		return placed{}, ErrOutsideRoot
+	}
+	return placed{target: target, lock: mirror.Path() + ".lock", stage: mirror.Folder().Path()}, nil
+}
+
+// The mirror consists of verified physical remainder components. Resolve each
+// new directory as a leaf so verbatim names retain their spelling; Pending's
+// portable new-name policy intentionally refuses such names.
+func mirrorFolder(path, root string) error {
+	id, err := fileid.Resolve(context.Background(), fileid.Self, path, fileid.Options{})
+	if err == nil {
+		if !id.IsDir() {
+			return fmt.Errorf("cas: %s is not a folder", path)
+		}
+		anchor, err := fileid.Resolve(context.Background(), fileid.Self, root, fileid.Options{})
+		if err != nil {
+			return err
+		}
+		if !id.Equal(anchor) {
+			if _, inside, err := physicalRelative(id.Path(), root); err != nil || !inside {
+				return ErrOutsideRoot
+			}
+		}
+		return nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	leaf, err := leafOf(path, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		parent := parentSpelling(path)
+		if parent == path {
+			return err
+		}
+		if err := mirrorFolder(parent, root); err != nil {
+			return err
+		}
+		leaf, err = leafOf(path, false)
+	}
+	if err != nil {
+		return err
+	}
+	if _, inside, err := physicalRelative(leaf.Path(), root); err != nil || !inside {
+		return ErrOutsideRoot
+	}
+	if err := os.Mkdir(leaf.Path(), 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	return nil
+}
+
+// Partition an input spelling without cleaning it; fileid owns its walk.
+func parentSpelling(path string) string {
+	i := strings.LastIndexAny(path, `/`+string(filepath.Separator))
+	if i < 0 {
+		return "."
+	}
+	if i <= len(filepath.VolumeName(path)) {
+		return path[:i+1]
+	}
+	return path[:i]
+}
+
+// Pending anchors the physical path at root when root contains it. Its Path
+// retains the exact resolved spelling, including verbatim Windows components.
+func placementRelative(path, root string) (string, bool, error) {
+	if _, err := leafOf(path, false); err == nil {
+		return physicalRelative(path, root)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", false, err
+	}
+	id, err := fileid.Resolve(context.Background(), fileid.Self, root, fileid.Options{})
+	if err != nil {
+		return "", false, err
+	}
+	pending, err := fileid.Pending(context.Background(), fileid.Self, path, root)
+	if err != nil {
+		return "", false, err
+	}
+	if !pending.Root().Equal(id) {
+		return "", false, nil
+	}
+	anchor, target := placementInput(id.Path()), placementInput(pending.Path())
+	if anchor == target {
+		return "", false, nil
+	}
+	prefix := strings.TrimRight(anchor, `/`+string(filepath.Separator)) + string(filepath.Separator)
+	if !strings.HasPrefix(target, prefix) {
+		return "", false, ErrOutsideRoot
+	}
+	return target[len(prefix):], true, nil
+}
+
+func physicalRelative(path, root string) (string, bool, error) {
+	leaf, err := leafOf(path, false)
+	if err != nil {
+		return "", false, err
+	}
+	folder, err := fileid.Open(context.Background(), fileid.Self, leaf.Folder().Path(), fileid.Options{})
+	if err != nil {
+		return "", false, err
+	}
+	defer folder.Close()
+	parent, err := fileid.Open(context.Background(), fileid.Self, root, fileid.Options{})
+	if err != nil {
+		return "", false, err
+	}
+	defer parent.Close()
+	relation, err := folder.Relate(parent)
+	if err != nil {
+		return "", false, err
+	}
+	switch relation.Kind {
+	case fileid.RelationSame:
+		return leaf.Name(), true, nil
+	case fileid.RelationInside:
+		return filepath.Join(relation.Rel, leaf.Name()), true, nil
+	default:
+		return "", false, nil
+	}
 }
 
 // commonDir is the deepest directory holding both a and b, by their

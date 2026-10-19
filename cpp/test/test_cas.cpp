@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <abstraction/cas.h>
+#include <abstraction/fileid.h>
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winioctl.h>
 #include <fcntl.h>
 #include <io.h>
 #else
@@ -35,6 +37,7 @@ extern char** environ;
 
 namespace fs = std::filesystem;
 using namespace abstraction::cas;
+namespace abstraction::fileid::testing {extern void (*before_open)(const std::filesystem::path&);}
 
 // Defined in cas.cpp for this test only.
 namespace abstraction::cas::testing {
@@ -292,9 +295,10 @@ static void an_ended_record_stays_ended() {
             } catch (const Ended&) {
                 std::lock_guard<std::mutex> g(mu);
                 ++refused;
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
                 std::lock_guard<std::mutex> g(mu);
                 ++failed;
+                std::fprintf(stderr, "ended-record edit failed: %s\n", error.what());
             }
         });
     }
@@ -424,7 +428,7 @@ static void directory_is_synced_after_the_rename() {
     write(p, std::nullopt, "first");
     testing::after_directory_sync = nullptr;
     check(synced.size() == 1, "one directory sync per write", std::to_string(synced.size()));
-    check(!synced.empty() && synced[0].first == p.parent_path(), "the target's directory is synced");
+    check(!synced.empty() && fs::equivalent(synced[0].first,p.parent_path()), "the target's physical directory is synced");
     check(!synced.empty() && synced[0].second == "first", "the directory is synced after the rename");
     fs::remove_all(dir);
 }
@@ -568,7 +572,85 @@ static void a_read_denied_past_its_deadline_is_refused() {
 
 static fs::path subject() { return env_path("CAS_PATH"); }
 
-int main() {
+// The same owned physical/alias shape used by Go's CAS/fileid conformance.
+// A junction requires no symbolic-link privilege on Windows.
+static void directory_link(const fs::path& link,const fs::path& target) {
+#ifdef _WIN32
+    fs::create_directory(link);
+    auto text=target.wstring();if(text.rfind(L"\\\\?\\",0)==0)text=text.substr(4);
+    text=L"\\??\\"+text;
+    std::vector<unsigned char> bytes(16+(text.size()+2)*sizeof(wchar_t),0);
+    DWORD tag=IO_REPARSE_TAG_MOUNT_POINT;USHORT length=USHORT(bytes.size()-8),offset=0,size=USHORT(text.size()*2),print_offset=USHORT(size+2);
+    std::memcpy(bytes.data(),&tag,4);std::memcpy(bytes.data()+4,&length,2);
+    std::memcpy(bytes.data()+8,&offset,2);std::memcpy(bytes.data()+10,&size,2);std::memcpy(bytes.data()+12,&print_offset,2);
+    std::memcpy(bytes.data()+16,text.data(),size);
+    HANDLE h=CreateFileW(link.c_str(),GENERIC_WRITE,0,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+    if(h==INVALID_HANDLE_VALUE)throw std::system_error(GetLastError(),std::system_category(),"fixture junction open");
+    DWORD n=0;BOOL ok=DeviceIoControl(h,FSCTL_SET_REPARSE_POINT,bytes.data(),DWORD(bytes.size()),nullptr,0,&n,nullptr);auto error=GetLastError();CloseHandle(h);
+    if(!ok)throw std::system_error(error,std::system_category(),"fixture junction set");
+#else
+    fs::create_directory_symlink(target,link);
+#endif
+}
+static void physical_layout_and_leaf() {
+    auto base=fresh_dir();auto root=base/"root",side=base/"side",outside_dir=base/"outside";
+    fs::create_directory(outside_dir);Placement store(root,side);
+    auto escape=root/"escape",alias=base/"alias";
+    directory_link(escape,outside_dir);directory_link(alias,root);
+    check(outside(store,escape/"record"),"physical junction escape refuses");
+    check(fs::is_empty(outside_dir),"physical refusal creates no outside record");
+    write(root/"record",std::nullopt,"a");change(alias/"record",[](const Value& v){return *v+"b";});
+    store.change(alias/"record",[](const Value& v){return *v+"c";});
+    check(read(root/"record")=="abc","physical alias reaches one placement target");
+    store.write(alias/"new"/"deep"/"value",std::nullopt,"pending");
+    check(read(root/"new"/"deep"/"value")=="pending","missing parents retain physical placement");
+    std::ofstream(base/"original")<<"original";fs::create_hard_link(base/"original",root/"entry");
+    store.write(root/"entry",Value("original"),"replacement");
+    check(read(base/"original")=="original"&&read(root/"entry")=="replacement","replacement replaces hard-link entry without following its target");
+#ifdef _WIN32
+    auto long_name=root/"LongCounterRecordForAlias.data";write(long_name,std::nullopt,"one");std::vector<wchar_t> short_name(32768);
+    auto n=GetShortPathNameW(long_name.c_str(),short_name.data(),DWORD(short_name.size()));
+    if(n&&n<short_name.size()&&fs::path(short_name.data())!=long_name){write(fs::path(short_name.data()),Value("one"),"two");check(read(long_name)=="two","existing 8.3 leaf alias replaces its long entry");}
+    else std::printf("  SKIP  this volume supplied no distinct 8.3 alias\n");
+    static unsigned opens=0;opens=0;abstraction::fileid::testing::before_open=[](const fs::path&){++opens;};
+    bool refused=false;try{write(fs::path(L"\\\\localhost\\never-open-this-share\\record"),std::nullopt,"x");}catch(const abstraction::fileid::NotLocal&){refused=true;}
+    abstraction::fileid::testing::before_open=nullptr;
+    check(refused&&opens==0,"network spelling refuses before any native open");
+#else
+    auto target=outside_dir/"nested";fs::create_directory(target);auto physical=root/"physical";directory_link(physical,target);
+    write(physical/".."/"record",std::nullopt,"physical-parent");check(read(outside_dir/"record")=="physical-parent","dot-dot follows a symbolic link's physical parent");fs::remove(physical);
+#endif
+    fs::remove(alias);fs::remove(escape);fs::remove_all(base);
+}
+
+static void side_mirror_is_contained() {
+    auto base=fresh_dir();auto root=base/"root",side=base/"side",outside_dir=base/"outside";
+    fs::create_directory(outside_dir);Placement store(root,side);
+    auto side_link=side/"sub";directory_link(side_link,outside_dir);
+    check(outside(store,root/"sub"/"value"),"side mirror junction escape refuses");
+    check(fs::is_empty(outside_dir)&&!fs::exists(root/"sub"),"side refusal creates no outside lock/stage or target parents");
+    fs::remove(side_link);fs::create_directory(side/"inside");directory_link(side_link,side/"inside");
+    store.write(root/"sub"/"value",std::nullopt,"inside");
+    check(read(root/"sub"/"value")=="inside"&&fs::exists(side/"inside"/"value.lock"),"inside side alias uses its physical mirror");
+    store.write(root/"sub"/"new"/"deep"/"value",std::nullopt,"pending");
+    check(read(root/"sub"/"new"/"deep"/"value")=="pending"&&fs::exists(side/"inside"/"new"/"deep"/"value.lock"),"pending mirror parents stay within the physical side");
+    fs::remove(side_link);fs::remove_all(base);
+}
+static void oversized_components_refuse_before_open() {
+#ifdef _WIN32
+    auto base=fresh_dir();fs::create_directory(base/"A");std::ofstream(base/"A"/"marker")<<"unchanged";
+    auto physical=abstraction::fileid::folder(base);
+    auto oversized=physical/fs::path(std::wstring(65537,L'A'))/"value";
+    static unsigned opens=0;opens=0;abstraction::fileid::testing::before_open=[](const fs::path&){++opens;};
+    bool refused=false;try{write(oversized,std::nullopt,"wrong");}catch(const abstraction::fileid::NotLocal&){refused=true;}
+    abstraction::fileid::testing::before_open=nullptr;
+    check(refused&&opens==0&&!fs::exists(base/"A"/"value")&&read(base/"A"/"marker")=="unchanged","oversized extended component refuses before any native open without truncating to A");
+    auto unicode=base/fs::u8path(u8"漢字-😀")/"value";write(unicode,std::nullopt,"unicode");
+    check(read(unicode)=="unicode","ordinary Unicode paths remain writable");fs::remove_all(base);
+#endif
+}
+
+static int run() {
     if (const char* name = std::getenv("CAS_ROLE")) {
         return role(name, subject(), std::atoi(std::getenv("CAS_N")));
     }
@@ -579,10 +661,44 @@ int main() {
     stale_write_is_refused();
     missing_reads_as_nullopt();
     missing_to_empty_is_a_change();
+    {
+        auto base = fresh_dir(); auto path = base / "record";
+        Placement placed(base, base / "side");
+        write(path, std::nullopt, "base");
+        change(path, [&](const Value& current) {
+            check(read(path) == current, "a nested read remains allowed");
+            bool refused = false;
+            try { placed.write(path, current, "wrong"); } catch (const std::logic_error&) { refused = true; }
+            check(refused, "alternate placement cannot bypass target-entry reentry guard");
+            refused = false;
+            try { sweep(path); } catch (const std::logic_error&) { refused = true; }
+            check(refused, "sweep refuses the currently edited target");
+#ifdef _WIN32
+            refused = false;
+            try { write(base / "RECORD", current, "wrong"); } catch (const std::logic_error&) { refused = true; }
+            check(refused, "Windows case alias cannot bypass target-entry reentry guard");
+#endif
+            write(base / "new-folder" / "different", std::nullopt, "allowed");
+            return *current;
+        });
+        check(read(path) == "base", "refused reentry leaves the target unchanged");
+        fs::remove_all(base);
+    }
+    {
+        auto base = fresh_dir();
+        std::string bytes(128 * 1024 + 13, '\0');
+        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = char(i);
+        write(base / "binary", std::nullopt, bytes);
+        check(read(base / "binary") == bytes, "binary staging completes multiple native write chunks");
+        fs::remove_all(base);
+    }
     no_lost_update_in_process();
     no_lost_update_across_processes();
     an_ended_record_stays_ended();
     placement_keeps_locks_and_staging_out_of_root();
+    physical_layout_and_leaf();
+    side_mirror_is_contained();
+    oversized_components_refuse_before_open();
     placement_refuses_what_it_does_not_cover();
     placement_refuses_a_real_second_volume();
     placement_loses_no_update_across_processes();
@@ -596,3 +712,5 @@ int main() {
 #endif
     return failures == 0 ? 0 : 1;
 }
+
+int main(){std::setvbuf(stdout,nullptr,_IONBF,0);try{return run();}catch(const std::exception& e){std::fprintf(stderr,"cas test exception: %s\n",e.what());return 2;}}

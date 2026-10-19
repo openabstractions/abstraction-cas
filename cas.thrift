@@ -30,6 +30,6 @@ struct Value {
  1: optional binary data(omit="absent")
 }(document="true",unknown_fields="refuse")
 service Store {
- Value Read(1:string path)(doc="Read the current bytes. Absent data means the file does not exist; present empty data means an empty file. Filesystem failures remain implementation errors.")
- void Write(1:string path, 2:Value base, 3:binary data)(doc="Replace only if current value equals base, including presence. A mismatch is Moved. A successful write holds the kernel lock through staging, synchronization and replacement. Missing output data is not an empty write. Existing provider errors remain errors; Change callbacks remain local conveniences.")
+ Value Read(1:string path)(readonly="true",doc="[Read](https://openabstractions.github.io/reference.html#concept-cas.read-file) the current bytes. Absent data means the file does not exist; present empty data means an empty file. Filesystem failures remain implementation errors.")
+ void Write(1:string path, 2:Value base, 3:binary data)(idempotent="true",doc="Replace only if current value equals base, including presence. A mismatch is Moved. A successful write holds the kernel lock through staging, synchronization and replacement. Missing output data is not an empty write. Existing provider errors remain errors; [Change](https://openabstractions.github.io/reference.html#concept-cas.change) callbacks remain local conveniences.")
 }(wire_name="abstraction.cas/store@1",doc="Compare-and-set over a file. This descriptor is emitted as a direct language interface with no IPC. Native providers own locking and replacement. The wire_name is schema metadata, not an available service endpoint.")

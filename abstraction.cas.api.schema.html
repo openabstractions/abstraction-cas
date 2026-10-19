@@ -2,11 +2,11 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Open Abstractions — schema</title>
+<title>OpenAbstractions — schema</title>
 <link rel="stylesheet" href="style.css">
 
 <main>
-<nav class="site" aria-label="Primary navigation"><a class="name" href="index.html">Open Abstractions</a>
+<nav class="site" aria-label="Primary navigation"><a class="name" href="index.html">OpenAbstractions</a>
 <a href="adopt.html">Adopt</a><a href="cases.html">Cases</a><span class="nav-devs-label">for developers</span><a href="reference.html">Reference</a><a href="coverage.html">Coverage</a><a href="catalogue.html">Catalogue</a><a href="https://github.com/openabstractions">GitHub</a></nav>
 
 
@@ -17,12 +17,12 @@
 <h2 id="service-Store">Interface <code>Store</code> <span class="tag">[DEF-S1]</span></h2>
 <p>Compare-and-set over a file. This descriptor is emitted as a direct language interface with no IPC. Native providers own locking and replacement. The wire_name is schema metadata, not an available service endpoint.</p>
 <p>Interface-only output: implement these methods directly. No IPC client, dispatcher, message envelope or transport binding is emitted. Record codecs remain available. Method return/error signatures are retained; oneway marks the schema declaration, not a delivery or persistence guarantee for a direct call.</p>
-<p>Read the current bytes. Absent data means the file does not exist; present empty data means an empty file. Filesystem failures remain implementation errors.</p>
-<h3><code>Read</code></h3><p><code>request-response</code> <code>Value</code></p><ul>
+<p><a href="https://openabstractions.github.io/reference.html#concept-cas.read-file">Read</a> the current bytes. Absent data means the file does not exist; present empty data means an empty file. Filesystem failures remain implementation errors.</p>
+<h3><code>Read</code></h3><p><code>request-response</code> <code>Value</code> · readonly <span class="tag">[DEF-S3]</span></p><ul>
 <li>Argument 1: <code>string</code> <code>path</code> (required, including zero/false/empty)</li>
 </ul>
-<p>Replace only if current value equals base, including presence. A mismatch is Moved. A successful write holds the kernel lock through staging, synchronization and replacement. Missing output data is not an empty write. Existing provider errors remain errors; Change callbacks remain local conveniences.</p>
-<h3><code>Write</code></h3><p><code>request-response</code> <code>void</code></p><ul>
+<p>Replace only if current value equals base, including presence. A mismatch is Moved. A successful write holds the kernel lock through staging, synchronization and replacement. Missing output data is not an empty write. Existing provider errors remain errors; <a href="https://openabstractions.github.io/reference.html#concept-cas.change">Change</a> callbacks remain local conveniences.</p>
+<h3><code>Write</code></h3><p><code>request-response</code> <code>void</code> · idempotent</p><ul>
 <li>Argument 1: <code>string</code> <code>path</code> (required, including zero/false/empty)</li>
 <li>Argument 2: <code>Value</code> <code>base</code> (required, including zero/false/empty)</li>
 <li>Argument 3: <code>binary</code> <code>data</code> (required, including zero/false/empty)</li>

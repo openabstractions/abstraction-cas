@@ -232,7 +232,7 @@ def _replace_at(placed, base, data):
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
+            _fsync_file(f.fileno())
         _rename_over(tmp, placed.target)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -301,6 +301,8 @@ if sys.platform == "win32":
         if not _k32.LockFileEx(msvcrt.get_osfhandle(fd), _EXCLUSIVE_LOCK, 0, 1, 0, overlapped):
             raise ctypes.WinError(ctypes.get_last_error())
 
+    _fsync_file = os.fsync
+
     def _fsync_dir(directory):
         try:
             h = _open_shared(directory, _GENERIC_WRITE, _BACKUP_SEMANTICS)
@@ -343,6 +345,7 @@ else:
 
     _TRANSIENT = ()
     _NO_DIRECTORY_FLUSH = (errno.EINVAL, errno.ENOTSUP)
+    _NO_FULL_FSYNC = (errno.ENOTSUP,)
 
     def _native(path):
         return os.path.abspath(os.fspath(path))
@@ -354,10 +357,23 @@ else:
     def _flock(fd):
         fcntl.flock(fd, fcntl.LOCK_EX)
 
+    def _fsync_file(fd):
+        # macOS fsync leaves data in the drive cache; F_FULLFSYNC flushes it.
+        # A volume that refuses F_FULLFSYNC with ENOTSUP gets the plain fsync, as in Go.
+        full = getattr(fcntl, "F_FULLFSYNC", None)
+        if full is not None:
+            try:
+                fcntl.fcntl(fd, full)
+                return
+            except OSError as e:
+                if e.errno not in _NO_FULL_FSYNC:
+                    raise
+        os.fsync(fd)
+
     def _fsync_dir(directory):
         fd = os.open(directory, os.O_RDONLY)
         try:
-            os.fsync(fd)
+            _fsync_file(fd)
         except OSError as e:
             if e.errno not in _NO_DIRECTORY_FLUSH:
                 raise

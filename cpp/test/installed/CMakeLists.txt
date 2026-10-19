@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(cas_installed_consumer LANGUAGES CXX)
-find_package(abstraction_cas 0.1 CONFIG REQUIRED)
+find_package(abstraction_cas 0.8 CONFIG REQUIRED)
 add_executable(cas_installed_consumer ../test_api.cpp)
 target_link_libraries(cas_installed_consumer PRIVATE abstraction::cas)
 enable_testing()

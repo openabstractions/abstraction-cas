@@ -8,27 +8,22 @@ import (
 	"syscall"
 )
 
-// syncDir flushes a directory after a rename in it, so the new entry survives
-// a power cut. A file system that cannot sync a directory answers EINVAL or
-// ENOTSUP, and the write stands without that guarantee.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTSUP) {
-		return err
-	}
-	return nil
-}
+func renameFile(tmp, path string) error { return renameRoot(tmp, path) }
+
+func placementInput(path string) string { return path }
 
 func transient(error) bool { return false }
 
 func flock(f *os.File) error { return syscall.Flock(int(f.Fd()), syscall.LOCK_EX) }
 
-func tryFlock(f *os.File) (bool, error) {
-	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+func tryFlock(f *os.File) (bool, error) { return tryFlockMode(f, false) }
+
+func tryFlockMode(f *os.File, shared bool) (bool, error) {
+	mode := syscall.LOCK_EX
+	if shared {
+		mode = syscall.LOCK_SH
+	}
+	err := syscall.Flock(int(f.Fd()), mode|syscall.LOCK_NB)
 	if err == nil {
 		return true, nil
 	}

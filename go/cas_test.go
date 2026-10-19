@@ -10,7 +10,26 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/openabstractions/abstraction-cas/go/internal/personfolders"
 )
+
+func TestReplaceLimitRepairsOversizedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "record.json")
+	if err := os.WriteFile(path, make([]byte, 128), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceLimit(path, 16, []byte(`{"ready":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceLimit(path, 16, make([]byte, 17)); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("oversized replacement: %v", err)
+	}
+	got, err := ReadLimit(path, 16)
+	if err != nil || string(got) != `{"ready":true}` {
+		t.Fatalf("record = %q, %v", got, err)
+	}
+}
 
 func counter(cur []byte) int {
 	if cur == nil {
@@ -28,10 +47,13 @@ func increment(cur []byte) ([]byte, error) {
 	return []byte(fmt.Sprintf("%d %d", n, n)), nil
 }
 
+// TestMain runs the tests with the person's per-user folders inside a
+// temporary folder (personfolders.Main); with CAS_PATH set, the binary is a
+// child process one of them started.
 func TestMain(m *testing.M) {
 	path, n := os.Getenv("CAS_PATH"), os.Getenv("CAS_N")
 	if path == "" {
-		os.Exit(m.Run())
+		os.Exit(personfolders.Main(m))
 	}
 	target, _ := strconv.Atoi(n)
 	read, change := Read, Change

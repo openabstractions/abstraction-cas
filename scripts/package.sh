@@ -16,7 +16,8 @@
 #                   root; C++ install: share/doc/<pkg>/LICENSE.
 #   description     what the ecosystem's page renders. PyPI: the README as
 #                   the Description body; pkg.go.dev: the package doc comment;
-#                   C++: Description in lib/pkgconfig/<pkg>.pc.
+#                   C++: Description in lib/pkgconfig/<pkg>.pc, or the installed
+#                   README for a CMake-only interface package.
 #   floor           the oldest platform we measured. Requires-Python; the go
 #                   directive; cxx_std_NN in the exported CMake targets.
 #   repository      the way back to the contract page. Project-URL: Source;
@@ -51,8 +52,8 @@
 #            the repository's root LICENSE unasked; no checkout here can
 #            reproduce it, so it is checked where it exists.
 #   C++      cmake --install of .split/<repo>/cpp into scratch, for cas,
-#            storage and watch, the layers whose C++ package installs a
-#            library with pkg-config and licence metadata.
+#            storage-content and watch; each is received using its actual
+#            CMake package and native or interface target shape.
 #
 #   scripts/package.sh                   every language
 #   scripts/package.sh python go cpp     a subset
@@ -126,6 +127,29 @@ cpp_cmake() (
     [ "${ABSTRACTION_CPP_CC+x}" != x ] || export CC="$ABSTRACTION_CPP_CC"
     [ "${ABSTRACTION_CPP_CXX+x}" != x ] || export CXX="$ABSTRACTION_CPP_CXX"
     "$CMAKE" "$@"
+)
+
+# Native clients consume the separately installed Identity SDK. Prepare its
+# installed target closure from the same split image.
+cpp_identity_dependency() (
+    dependency_source=$1
+    dependency_work=$2
+    if ! cpp_cmake -S "$dependency_source" -B "$dependency_work/build" \
+        -DABSTRACTION_IPC_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release \
+        > "$dependency_work.configure.log" 2>&1; then
+        printf 'Identity SDK configure failed: %s\n' "$(tail -3 "$dependency_work.configure.log" | tr '\n' ' ')"
+        return 1
+    fi
+    if ! cpp_cmake --build "$dependency_work/build" --config Release \
+        > "$dependency_work.build.log" 2>&1; then
+        printf 'Identity SDK build failed: %s\n' "$(tail -3 "$dependency_work.build.log" | tr '\n' ' ')"
+        return 1
+    fi
+    if ! cpp_cmake --install "$dependency_work/build" --config Release \
+        --prefix "$dependency_work/prefix" > "$dependency_work.install.log" 2>&1; then
+        printf 'Identity SDK install failed: %s\n' "$(tail -3 "$dependency_work.install.log" | tr '\n' ' ')"
+        return 1
+    fi
 )
 CMAKE="${ABSTRACTION_CMAKE:-$(command -v cmake 2>/dev/null || true)}"
 for c in "/c/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe" \
@@ -240,7 +264,14 @@ check_install() {   # $1 prefix $2 package name (abstraction_x)
         MISSING="$MISSING; no share/doc/$2/LICENSE"
     fi
     pc="$1/lib/pkgconfig/$2.pc"
-    if [ -f "$pc" ]; then
+    if [ "$2" = abstraction_storage_content ]; then
+        readme="$1/share/doc/$2/README.md"
+        if [ ! -f "$readme" ] || [ "$(wc -c < "$readme" 2>/dev/null || echo 0)" -lt 200 ]; then
+            MISSING="$MISSING; no installed Storage content package description"
+        fi
+        grep -qs "^Source: https://github.com/$ORG/abstraction-storage$" "$readme" ||
+            MISSING="$MISSING; no installed Storage source repository link"
+    elif [ -f "$pc" ]; then
         grep -q '^Description: .' "$pc" || MISSING="$MISSING; $2.pc has no Description"
         grep -q "^URL: https://github.com/$ORG/" "$pc" || MISSING="$MISSING; $2.pc has no URL back to the repository"
     else
@@ -253,6 +284,33 @@ check_install() {   # $1 prefix $2 package name (abstraction_x)
         MISSING="$MISSING; no ${2}ConfigVersion.cmake"
     fi
     grep -qs 'cxx_std_[0-9]' "$cm/${2}Targets.cmake" || MISSING="$MISSING; no cxx_std_NN in the exported targets (the floor)"
+    if [ "$2" = abstraction_storage_content ]; then
+        # The service-client package began at 0.2; trains since 0.8.0 carry the train's version.
+        case "$VERSION" in ""|0.0.*|0.1.*) MISSING="$MISSING; Storage content package predates the 0.2 service client" ;; esac
+        for required in "$cm/${2}Config.cmake" \
+            "$1/include/abstraction/storage/client.hpp" \
+            "$1/include/abstraction/storage/content/rec.h"; do
+            [ -f "$required" ] || MISSING="$MISSING; missing $required"
+        done
+        for target in storage_content storage_client; do
+            grep -Fqs "add_library(abstraction::$target INTERFACE IMPORTED)" "$cm/${2}Targets.cmake" ||
+                MISSING="$MISSING; missing imported interface $target"
+        done
+        grep -Fqs 'find_dependency(abstraction_ipc CONFIG)' "$cm/${2}Config.cmake" ||
+            MISSING="$MISSING; missing installed Identity dependency"
+        grep -Fqs 'abstraction::storage_content;abstraction::ipc' "$cm/${2}Targets.cmake" ||
+            MISSING="$MISSING; missing Storage client link closure"
+        for retired in "$1/include/abstraction/storage/storage.h" \
+            "$1/lib/cmake/abstraction_storage" "$1/lib/pkgconfig/abstraction_storage.pc" \
+            "$1/lib/libabstraction_storage.a" \
+            "$1/lib/abstraction_storage.lib" "$1/bin/abstraction_storage.dll" \
+            "$1/lib/libabstraction_storage.so" "$1/lib/libabstraction_storage.dylib"; do
+            [ ! -e "$retired" ] || MISSING="$MISSING; retired Storage provider remains: $retired"
+        done
+        if grep -Fqs 'add_library(abstraction::storage ' "$cm/${2}Targets.cmake"; then
+            MISSING="$MISSING; retired Storage provider target remains"
+        fi
+    fi
     foreign=$(ls "$1/include" 2>/dev/null | grep -vx abstraction || true)
     [ -z "$foreign" ] || MISSING="$MISSING; include/ carries headers that are not ours: $(printf '%s' "$foreign" | tr '\n' ' ')"
 }
@@ -436,6 +494,7 @@ if want cpp; then
 printf '\n\033[1mC++ — cmake --install of the published layer, into scratch\033[0m\n'
 for repo in abstraction-cas abstraction-storage abstraction-watch; do
     name="abstraction_${repo#abstraction-}"
+    [ "$repo" != abstraction-storage ] || name=abstraction_storage_content
     src="$SPLIT/$repo/cpp"
     if [ ! -f "$src/CMakeLists.txt" ]; then
         record UNPROVEN "$repo cpp: $src/CMakeLists.txt is not there — run sh scripts/oa.sh split"
@@ -446,7 +505,26 @@ for repo in abstraction-cas abstraction-storage abstraction-watch; do
         continue
     fi
     b="$WORK/cpp-$repo"
-    if ! cpp_cmake -S "$src" -B "$b/build" -DABSTRACTION_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release > "$b.configure.log" 2>&1; then
+    set -- -S "$src" -B "$b/build" -DABSTRACTION_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+    # Exported dependency declarations select the same-split SDK bootstrap.
+    # Older standalone CAS sources can still have no Identity dependency.
+    if { [ "$repo" = abstraction-cas ] && \
+        grep -q 'find_dependency(abstraction_fileid' "$src/cmake/abstraction_casConfig.cmake.in"; } || \
+       { [ "$repo" = abstraction-storage ] && \
+        grep -q 'find_dependency(abstraction_ipc' "$src/cmake/abstraction_storage_contentConfig.cmake.in"; }; then
+        dependency_source="$SPLIT/abstraction-identity/cpp"
+        dependency_work="$WORK/cpp-abstraction-identity"
+        if [ ! -f "$dependency_source/CMakeLists.txt" ]; then
+            record UNPROVEN "$repo cpp: Identity SDK dependency is missing from the split image"
+            continue
+        fi
+        if ! dependency_error=$(cpp_identity_dependency "$dependency_source" "$dependency_work"); then
+            record FAIL "$repo cpp: $dependency_error"
+            continue
+        fi
+        set -- "$@" "-DCMAKE_PREFIX_PATH=$dependency_work/prefix"
+    fi
+    if ! cpp_cmake "$@" > "$b.configure.log" 2>&1; then
         record FAIL "$repo cpp: does not configure from the published sources — $(grep -A3 'CMake Error' "$b.configure.log" | sed '1d; /^Call Stack/,$d' | tr -s ' \n' ' ')"
         continue
     fi

@@ -10,7 +10,7 @@ import (
 	"unsafe"
 )
 
-var setFileInformationByHandle = syscall.NewLazyDLL("kernel32.dll").NewProc("SetFileInformationByHandle")
+var setFileInformationByHandle = kernel32.NewProc("SetFileInformationByHandle")
 
 // A read that meets a file whose deletion is pending waits for the name to
 // settle. Opening a delete-pending file answers access denied, the state a

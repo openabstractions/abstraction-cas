@@ -7,5 +7,6 @@ Name: abstraction_cas
 Description: Atomic compare-and-set over files using kernel locks
 URL: https://github.com/openabstractions/abstraction-cas
 Version: @PROJECT_VERSION@
+Requires: abstraction_fileid >= 0.1.0
 Libs: -L${libdir} -labstraction_cas
 Cflags: -I${includedir}

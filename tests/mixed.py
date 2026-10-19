@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 
-here = os.path.dirname(os.path.abspath(__file__))
+here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(here, "python"))
 import abstraction_cas as cas
 
